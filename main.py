@@ -25,6 +25,8 @@ import winocr
 import pykakasi
 from deep_translator import GoogleTranslator
 from concurrent.futures import ThreadPoolExecutor
+import webbrowser
+import urllib.parse
 
 # Lazy-initialised manga-ocr instance (loaded only if OCR_ENGINE == "manga")
 _manga_ocr = None
@@ -289,6 +291,20 @@ class ScreenFreezerApp:
                 win_text = line.get('text', '').strip()
                 bbox = get_line_bounding_rect(line)  # now in full-screen coords
 
+                # Collect word-level data for selectable regions
+                words_data = []
+                for word in line.get('words', []):
+                    br = word['bounding_rect']
+                    wt = word.get('text', '').strip()
+                    if wt:
+                        words_data.append({
+                            'text': wt,
+                            'x': br['x'],
+                            'y': br['y'],
+                            'width': br['width'],
+                            'height': br['height']
+                        })
+
                 if OCR_ENGINE == "manga":
                     # Crop from the full-screen image using full-screen coords
                     crop_pil = pil_img.crop((
@@ -309,17 +325,17 @@ class ScreenFreezerApp:
                 text = text.strip()
                 if not text or not contains_japanese(text):
                     continue
-                translation_targets.append((text, bbox, crop_pil))
+                translation_targets.append((text, bbox, crop_pil, words_data))
 
             # Fetch translations in parallel
             boxes = []
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {
-                    executor.submit(translate_and_convert, text): (bbox, crop_pil)
-                    for text, bbox, crop_pil in translation_targets
+                    executor.submit(translate_and_convert, text): (bbox, crop_pil, words_data)
+                    for text, bbox, crop_pil, words_data in translation_targets
                 }
                 for future in futures:
-                    bbox, crop_pil = futures[future]
+                    bbox, crop_pil, words_data = futures[future]
                     try:
                         res = future.result()
                         # For windows engine, crop now using full-screen coords
@@ -344,7 +360,8 @@ class ScreenFreezerApp:
                             'h': h,
                             'data': res,
                             'orig_bbox': bbox,
-                            'crop_pil': crop_pil
+                            'crop_pil': crop_pil,
+                            'words': words_data
                         })
                     except Exception as e:
                         print("Error processing translation:", e)
@@ -360,7 +377,6 @@ class ScreenFreezerApp:
         if not self.active_window:
             return
 
-        # Remove loader text and background
         self.canvas.delete(self.loader_text)
         self.canvas.delete("loader_bg")
 
@@ -369,6 +385,11 @@ class ScreenFreezerApp:
         self.hover_window_id = None
         self.highlight_refs = []
         self.crop_tk_imgs = []
+        self.is_dragging = False
+        self.selection_box_idx = -1
+        self.selection_start = -1
+        self.selection_end = -1
+        self.selection_overlays = []
 
         for box in boxes:
             orig = box['orig_bbox']
@@ -379,15 +400,19 @@ class ScreenFreezerApp:
             )
             self.highlight_refs.append(ref)
 
-        # Bind mouse events for hover-based display
         self.canvas.bind("<Motion>", self.on_mouse_move)
         self.canvas.bind("<Leave>", lambda e: self.clear_hover_translation())
+        self.canvas.bind("<Button-1>", self.on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Button-3>", self.on_right_click)
 
     def on_mouse_move(self, event):
+        if self.is_dragging:
+            return
         if not hasattr(self, 'ocr_boxes') or not self.ocr_boxes:
             return
 
-        # Find which box the mouse is over (canvas coords match monitor coords)
         hover_idx = -1
         for i, box in enumerate(self.ocr_boxes):
             ob = box['orig_bbox']
@@ -406,7 +431,6 @@ class ScreenFreezerApp:
         if self.hover_window_id:
             self.canvas.delete(self.hover_window_id)
             self.hover_window_id = None
-        # Reset highlight colors
         for ref in self.highlight_refs:
             self.canvas.itemconfig(ref, outline="#007aff", width=2)
         self.current_hover_idx = -1
@@ -418,12 +442,10 @@ class ScreenFreezerApp:
         w = box['w']
         h = box['h']
 
-        # Highlight the hovered box more prominently
         idx = self.ocr_boxes.index(box)
         if 0 <= idx < len(self.highlight_refs):
             self.canvas.itemconfig(self.highlight_refs[idx], outline="#ff9500", width=3)
 
-        # Position: try below first, then above, then center
         screen_w = self.canvas.winfo_width()
         screen_h = self.canvas.winfo_height()
 
@@ -439,7 +461,6 @@ class ScreenFreezerApp:
         x = max(0, min(x, screen_w - w))
         y = max(0, min(y, screen_h - h))
 
-        # Build the translation card
         frame = tk.Frame(
             self.canvas, bg="#ffffff", padx=8, pady=6,
             highlightbackground="#e5e5ea", highlightcolor="#e5e5ea",
@@ -449,25 +470,123 @@ class ScreenFreezerApp:
         crop_tk = ImageTk.PhotoImage(crop_pil)
         self.crop_tk_imgs.append(crop_tk)
         tk.Label(frame, image=crop_tk, bg="#ffffff", bd=0).pack(anchor="w", pady=(0, 4))
-
         tk.Label(frame, text=data['original'], fg="#a31515", bg="#ffffff",
                  font=("Segoe UI", 11, "bold"), anchor="w", justify="left"
                  ).pack(fill="x", pady=(0, 2))
-
         tk.Label(frame, text=data['kana'], fg="#248a3d", bg="#ffffff",
                  font=("Segoe UI", 10, "normal"), anchor="w", justify="left"
                  ).pack(fill="x", pady=(0, 2))
-
         tk.Label(frame, text=data['romaji'], fg="#0066cc", bg="#ffffff",
                  font=("Segoe UI", 9, "italic"), anchor="w", justify="left"
                  ).pack(fill="x", pady=(0, 2))
-
         tk.Label(frame, text=data['english'], fg="#1c1c1e", bg="#ffffff",
                  font=("Segoe UI", 11, "bold"), anchor="w", justify="left",
                  wraplength=w - 16
                  ).pack(fill="x")
 
         self.hover_window_id = self.canvas.create_window(x, y, window=frame, anchor="nw")
+
+    # ── Word-level selection & clipboard ──────────────────────────────────────
+
+    def get_word_at_pos(self, box_idx, x, y):
+        words = self.ocr_boxes[box_idx].get('words', [])
+        for wi, w in enumerate(words):
+            if w['x'] <= x <= w['x'] + w['width'] and \
+               w['y'] <= y <= w['y'] + w['height']:
+                return wi
+        # fallback: closest word by center distance
+        best, best_d = -1, float('inf')
+        for wi, w in enumerate(words):
+            cx = w['x'] + w['width'] / 2
+            cy = w['y'] + w['height'] / 2
+            d = (cx - x) ** 2 + (cy - y) ** 2
+            if d < best_d:
+                best_d = d
+                best = wi
+        return best
+
+    def clear_selection_visuals(self):
+        for item in self.selection_overlays:
+            self.canvas.delete(item)
+        self.selection_overlays = []
+
+    def on_mouse_down(self, event):
+        self.clear_selection_visuals()
+        self.selection_box_idx = -1
+        self.selection_start = -1
+        self.selection_end = -1
+
+        for bi, box in enumerate(self.ocr_boxes):
+            ob = box['orig_bbox']
+            if ob['x'] <= event.x <= ob['x'] + ob['width'] and \
+               ob['y'] <= event.y <= ob['y'] + ob['height']:
+                self.selection_box_idx = bi
+                wi = self.get_word_at_pos(bi, event.x, event.y)
+                if wi >= 0:
+                    self.selection_start = wi
+                    self.selection_end = wi
+                    self.draw_selection_highlight()
+                self.is_dragging = True
+                break
+
+    def on_drag(self, event):
+        if self.selection_box_idx < 0:
+            return
+        box = self.ocr_boxes[self.selection_box_idx]
+        ob = box['orig_bbox']
+        if not (ob['x'] <= event.x <= ob['x'] + ob['width'] and
+                ob['y'] <= event.y <= ob['y'] + ob['height']):
+            return
+        wi = self.get_word_at_pos(self.selection_box_idx, event.x, event.y)
+        if wi >= 0 and wi != self.selection_end:
+            self.selection_end = wi
+            self.draw_selection_highlight()
+
+    def draw_selection_highlight(self):
+        self.clear_selection_visuals()
+        if self.selection_box_idx < 0 or self.selection_start < 0 or self.selection_end < 0:
+            return
+        start = min(self.selection_start, self.selection_end)
+        end = max(self.selection_start, self.selection_end)
+        words = self.ocr_boxes[self.selection_box_idx].get('words', [])
+        for wi in range(start, end + 1):
+            if wi < len(words):
+                w = words[wi]
+                item = self.canvas.create_rectangle(
+                    w['x'], w['y'], w['x'] + w['width'], w['y'] + w['height'],
+                    fill="#007aff", stipple="gray50", outline=""
+                )
+                self.selection_overlays.append(item)
+
+    def on_release(self, event):
+        if not self.is_dragging:
+            return
+        self.is_dragging = False
+        if self.selection_box_idx < 0 or self.selection_start < 0 or self.selection_end < 0:
+            return
+        start = min(self.selection_start, self.selection_end)
+        end = max(self.selection_start, self.selection_end)
+        words = self.ocr_boxes[self.selection_box_idx].get('words', [])
+        selected = ''.join(w['text'] for wi, w in enumerate(words) if start <= wi <= end)
+        if selected:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected)
+            print(f"[clipboard] {selected}")
+
+    def on_right_click(self, event):
+        text_to_search = None
+        # Prefer current selection
+        if self.selection_box_idx >= 0 and self.selection_start >= 0 and self.selection_end >= 0:
+            start = min(self.selection_start, self.selection_end)
+            end = max(self.selection_start, self.selection_end)
+            words = self.ocr_boxes[self.selection_box_idx].get('words', [])
+            text_to_search = ''.join(w['text'] for wi, w in enumerate(words) if start <= wi <= end)
+        if not text_to_search and self.current_hover_idx >= 0:
+            # Fallback to hovered box text
+            text_to_search = self.ocr_boxes[self.current_hover_idx]['data']['original']
+        if text_to_search:
+            url = f"https://jisho.org/search/{urllib.parse.quote(text_to_search)}"
+            webbrowser.open(url)
 
     def unfreeze_screen(self):
         if self.active_window:
@@ -480,6 +599,11 @@ class ScreenFreezerApp:
             self.current_hover_idx = -1
             self.hover_window_id = None
             self.highlight_refs = []
+            self.is_dragging = False
+            self.selection_box_idx = -1
+            self.selection_start = -1
+            self.selection_end = -1
+            self.selection_overlays = []
 
         # Restore focus to the previously active window
         if self.previous_hwnd:
