@@ -8,7 +8,7 @@ import threading
 # ── OCR engine selector ──────────────────────────────────────────────────────
 # Set to "manga" for manga-ocr (best accuracy, uses ML model, slower first run)
 # Set to "windows" for Windows Native OCR (fast, no extra model download)
-OCR_ENGINE = "manga"
+OCR_ENGINE = "windows"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # torch MUST be imported before tkinter on Windows to avoid c10.dll WinError 1114
@@ -130,46 +130,6 @@ def get_line_bounding_rect(line):
         'width': max_right - min_x,
         'height': max_bottom - min_y
     }
-
-def resolve_overlaps(boxes, screen_w, screen_h, padding=10):
-    """Lay boxes out so they don't overlap: try horizontal neighbours first,
-    then fall back to moving down. Finally clamp every box to the screen."""
-
-    def overlaps(a, b):
-        return (a['x'] < b['x'] + b['w'] + padding and
-                a['x'] + a['w'] + padding > b['x'] and
-                a['y'] < b['y'] + b['h'] + padding and
-                a['y'] + a['h'] + padding > b['y'])
-
-    # Sort top-to-bottom, left-to-right so earlier boxes "win" their position
-    placed = sorted(range(len(boxes)),
-                    key=lambda i: (boxes[i]['y'], boxes[i]['x']))
-
-    for i in placed:
-        box = boxes[i]
-        # Try up to 5 horizontal slots before giving up and going vertical
-        for attempt in range(50):
-            collision = False
-            for j in placed:
-                if j == i:
-                    continue
-                if overlaps(box, boxes[j]):
-                    collision = True
-                    # First try moving right
-                    right_x = boxes[j]['x'] + boxes[j]['w'] + padding
-                    if right_x + box['w'] <= screen_w:
-                        box['x'] = right_x
-                    else:
-                        # No room to the right – push down and reset x
-                        box['y'] = boxes[j]['y'] + boxes[j]['h'] + padding
-                        box['x'] = max(0, boxes[i]['orig_x'])
-                    break
-            if not collision:
-                break
-
-        # Clamp to screen bounds
-        box['x'] = max(0, min(box['x'], screen_w - box['w']))
-        box['y'] = max(0, min(box['y'], screen_h - box['h']))
 
 class ScreenFreezerApp:
     def __init__(self):
@@ -303,7 +263,7 @@ class ScreenFreezerApp:
         win_x, win_y = win_local['x'], win_local['y']
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
         
-        OCR_SCALE = 3
+        OCR_SCALE = 5
         try:
             # Upscale the focused window crop for better OCR accuracy
             ocr_img = win_crop.resize(
@@ -379,17 +339,7 @@ class ScreenFreezerApp:
                         # Estimate height including cropped image height
                         h = bbox['height'] + 110 + (len(res['english']) // 40) * 16
                         
-                        # Position translation box below the original text (full-screen coords)
-                        x = max(0, bbox['x'] + (bbox['width'] - w) // 2)
-                        y = max(0, bbox['y'] + bbox['height'] + 5)
-                        # Clamp initial position to screen
-                        x = min(x, pil_img.width - w)
-                        y = min(y, pil_img.height - h)
-                        
                         boxes.append({
-                            'x': x,
-                            'y': y,
-                            'orig_x': x,   # remember preferred x for reset
                             'w': w,
                             'h': h,
                             'data': res,
@@ -399,9 +349,6 @@ class ScreenFreezerApp:
                     except Exception as e:
                         print("Error processing translation:", e)
 
-            # Resolve overlaps with horizontal-first stacking, clamped to screen
-            resolve_overlaps(boxes, pil_img.width, pil_img.height, padding=12)
-            
             # Post result back to main GUI thread
             self.msg_queue.put(("ocr_complete", boxes))
         except Exception as e:
@@ -409,7 +356,7 @@ class ScreenFreezerApp:
             self.msg_queue.put(("ocr_complete", []))
 
     def display_translations(self, boxes):
-        """Draw the translations over the frozen screen."""
+        """Store OCR results, draw highlights, and enable hover-to-show translation."""
         if not self.active_window:
             return
 
@@ -417,88 +364,110 @@ class ScreenFreezerApp:
         self.canvas.delete(self.loader_text)
         self.canvas.delete("loader_bg")
 
+        self.ocr_boxes = boxes
+        self.current_hover_idx = -1
+        self.hover_window_id = None
+        self.highlight_refs = []
         self.crop_tk_imgs = []
+
         for box in boxes:
-            data = box['data']
-            crop_pil = box['crop_pil']
-            
-            # Highlight original text area
             orig = box['orig_bbox']
-            self.canvas.create_rectangle(
+            ref = self.canvas.create_rectangle(
                 orig['x'] - 2, orig['y'] - 2,
                 orig['x'] + orig['width'] + 2, orig['y'] + orig['height'] + 2,
-                outline="#007aff", width=2
+                outline="#007aff", width=2, tags="ocr_highlight"
             )
+            self.highlight_refs.append(ref)
 
-            # Create a card frame for the translation
-            frame = tk.Frame(
-                self.canvas,
-                bg="#ffffff",
-                padx=8,
-                pady=6,
-                highlightbackground="#e5e5ea",
-                highlightcolor="#e5e5ea",
-                highlightthickness=1,
-                bd=0
-            )
-            
-            # Row 1: Cropped image of original text
-            crop_tk = ImageTk.PhotoImage(crop_pil)
-            self.crop_tk_imgs.append(crop_tk)
-            lbl_crop = tk.Label(frame, image=crop_tk, bg="#ffffff", bd=0)
-            lbl_crop.pack(anchor="w", pady=(0, 4))
-            
-            # Row 2: Raw OCR (Kanji/original, bold, dark red)
-            lbl_raw = tk.Label(
-                frame, 
-                text=data['original'], 
-                fg="#a31515", 
-                bg="#ffffff", 
-                font=("Segoe UI", 11, "bold"),
-                anchor="w",
-                justify="left"
-            )
-            lbl_raw.pack(fill="x", pady=(0, 2))
+        # Bind mouse events for hover-based display
+        self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.bind("<Leave>", lambda e: self.clear_hover_translation())
 
-            # Row 3: Kana (Hiragana / Katakana, normal, green)
-            lbl_kana = tk.Label(
-                frame, 
-                text=data['kana'], 
-                fg="#248a3d", 
-                bg="#ffffff", 
-                font=("Segoe UI", 10, "normal"),
-                anchor="w",
-                justify="left"
-            )
-            lbl_kana.pack(fill="x", pady=(0, 2))
+    def on_mouse_move(self, event):
+        if not hasattr(self, 'ocr_boxes') or not self.ocr_boxes:
+            return
 
-            # Row 4: Romaji (italic, blue)
-            lbl_romaji = tk.Label(
-                frame, 
-                text=data['romaji'], 
-                fg="#0066cc", 
-                bg="#ffffff", 
-                font=("Segoe UI", 9, "italic"),
-                anchor="w",
-                justify="left"
-            )
-            lbl_romaji.pack(fill="x", pady=(0, 2))
+        # Find which box the mouse is over (canvas coords match monitor coords)
+        hover_idx = -1
+        for i, box in enumerate(self.ocr_boxes):
+            ob = box['orig_bbox']
+            if ob['x'] <= event.x <= ob['x'] + ob['width'] and \
+               ob['y'] <= event.y <= ob['y'] + ob['height']:
+                hover_idx = i
+                break
 
-            # Row 5: English Translation (bold, black)
-            lbl_english = tk.Label(
-                frame, 
-                text=data['english'], 
-                fg="#1c1c1e", 
-                bg="#ffffff", 
-                font=("Segoe UI", 11, "bold"),
-                anchor="w",
-                justify="left",
-                wraplength=box['w'] - 16
-            )
-            lbl_english.pack(fill="x")
+        if hover_idx != self.current_hover_idx:
+            self.clear_hover_translation()
+            self.current_hover_idx = hover_idx
+            if hover_idx >= 0:
+                self.show_hover_translation(self.ocr_boxes[hover_idx])
 
-            # Place frame on canvas
-            self.canvas.create_window(box['x'], box['y'], window=frame, anchor="nw")
+    def clear_hover_translation(self):
+        if self.hover_window_id:
+            self.canvas.delete(self.hover_window_id)
+            self.hover_window_id = None
+        # Reset highlight colors
+        for ref in self.highlight_refs:
+            self.canvas.itemconfig(ref, outline="#007aff", width=2)
+        self.current_hover_idx = -1
+
+    def show_hover_translation(self, box):
+        data = box['data']
+        crop_pil = box['crop_pil']
+        orig = box['orig_bbox']
+        w = box['w']
+        h = box['h']
+
+        # Highlight the hovered box more prominently
+        idx = self.ocr_boxes.index(box)
+        if 0 <= idx < len(self.highlight_refs):
+            self.canvas.itemconfig(self.highlight_refs[idx], outline="#ff9500", width=3)
+
+        # Position: try below first, then above, then center
+        screen_w = self.canvas.winfo_width()
+        screen_h = self.canvas.winfo_height()
+
+        x = orig['x'] + (orig['width'] - w) // 2
+        y = orig['y'] + orig['height'] + 8
+
+        if y + h > screen_h:
+            y = orig['y'] - h - 8
+            if y < 0:
+                y = (screen_h - h) // 2
+                x = (screen_w - w) // 2
+
+        x = max(0, min(x, screen_w - w))
+        y = max(0, min(y, screen_h - h))
+
+        # Build the translation card
+        frame = tk.Frame(
+            self.canvas, bg="#ffffff", padx=8, pady=6,
+            highlightbackground="#e5e5ea", highlightcolor="#e5e5ea",
+            highlightthickness=1, bd=0
+        )
+
+        crop_tk = ImageTk.PhotoImage(crop_pil)
+        self.crop_tk_imgs.append(crop_tk)
+        tk.Label(frame, image=crop_tk, bg="#ffffff", bd=0).pack(anchor="w", pady=(0, 4))
+
+        tk.Label(frame, text=data['original'], fg="#a31515", bg="#ffffff",
+                 font=("Segoe UI", 11, "bold"), anchor="w", justify="left"
+                 ).pack(fill="x", pady=(0, 2))
+
+        tk.Label(frame, text=data['kana'], fg="#248a3d", bg="#ffffff",
+                 font=("Segoe UI", 10, "normal"), anchor="w", justify="left"
+                 ).pack(fill="x", pady=(0, 2))
+
+        tk.Label(frame, text=data['romaji'], fg="#0066cc", bg="#ffffff",
+                 font=("Segoe UI", 9, "italic"), anchor="w", justify="left"
+                 ).pack(fill="x", pady=(0, 2))
+
+        tk.Label(frame, text=data['english'], fg="#1c1c1e", bg="#ffffff",
+                 font=("Segoe UI", 11, "bold"), anchor="w", justify="left",
+                 wraplength=w - 16
+                 ).pack(fill="x")
+
+        self.hover_window_id = self.canvas.create_window(x, y, window=frame, anchor="nw")
 
     def unfreeze_screen(self):
         if self.active_window:
@@ -507,6 +476,10 @@ class ScreenFreezerApp:
             self.tk_img = None
             self.pil_img = None
             self.crop_tk_imgs = []
+            self.ocr_boxes = []
+            self.current_hover_idx = -1
+            self.hover_window_id = None
+            self.highlight_refs = []
 
         # Restore focus to the previously active window
         if self.previous_hwnd:
@@ -584,9 +557,6 @@ def main():
         app.run()
     except KeyboardInterrupt:
         pass
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
