@@ -11,6 +11,12 @@ import threading
 OCR_ENGINE = "windows"
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Window capture crop (px to trim from captured window edges) ──────────────
+CROP_TOP = 30
+CROP_BOTTOM = 10
+CROP_LEFT = 10
+CROP_RIGHT = 10
+
 # torch MUST be imported before tkinter on Windows to avoid c10.dll WinError 1114
 if OCR_ENGINE == "manga":
     try:
@@ -192,68 +198,56 @@ class ScreenFreezerApp:
             'h': min(monitor['height'], win_rect['bottom'] - my_off) - max(0, win_rect['top']  - my_off),
         }
 
-        # 3. Create borderless fullscreen window matching the monitor geometry
+        # Apply crop margins to trim window chrome / unwanted edges
+        win_local['x'] += CROP_LEFT
+        win_local['y'] += CROP_TOP
+        win_local['w'] -= CROP_LEFT + CROP_RIGHT
+        win_local['h'] -= CROP_TOP + CROP_BOTTOM
+
+        # 3. Create overlay window positioned over the game window (not full screen)
+        overlay_x = win_rect['left'] + CROP_LEFT
+        overlay_y = win_rect['top'] + CROP_TOP
+        overlay_w = win_local['w']
+        overlay_h = win_local['h']
+
         self.active_window = tk.Toplevel(self.root)
         self.active_window.overrideredirect(True)
-        self.active_window.geometry(f"{monitor['width']}x{monitor['height']}+{monitor['left']}+{monitor['top']}")
-        
-        # Use Canvas instead of Label so we can draw text boxes on top
+        self.active_window.geometry(f"{overlay_w}x{overlay_h}+{overlay_x}+{overlay_y}")
+
         self.canvas = tk.Canvas(self.active_window, borderwidth=0, highlightthickness=0, bg="black")
         self.canvas.pack(fill="both", expand=True)
 
-        # 4a. Full screen as the base (seamless background layer)
-        self.tk_img = ImageTk.PhotoImage(self.pil_img)
+        # 4. Show only the cropped game window content as background
+        bg_crop = self.pil_img.crop((win_local['x'], win_local['y'],
+                                      win_local['x'] + win_local['w'],
+                                      win_local['y'] + win_local['h']))
+        self.tk_img = ImageTk.PhotoImage(bg_crop)
         self.canvas.create_image(0, 0, image=self.tk_img, anchor="nw")
 
-        # 4b. Dim everything outside the focused window to draw the eye to it
-        #     Four dark rectangles forming a vignette around the window region
-        wx, wy, ww, wh = win_local['x'], win_local['y'], win_local['w'], win_local['h']
-        mw, mh = monitor['width'], monitor['height']
-        DIM = "#00000088"  # semi-transparent black (tkinter stipple trick)
-        _STIPPLE = "gray50"  # 50% stipple for alpha-like dimming
-        for coords in [
-            (0,      0,       mw,       wy),         # top
-            (0,      wy+wh,   mw,       mh),         # bottom
-            (0,      wy,      wx,       wy+wh),      # left
-            (wx+ww,  wy,      mw,       wy+wh),      # right
-        ]:
-            if coords[2] > coords[0] and coords[3] > coords[1]:
-                self.canvas.create_rectangle(
-                    *coords, fill="black", stipple=_STIPPLE, outline=""
-                )
+        # Draw a subtle border to indicate the overlay is active
+        self.canvas.create_rectangle(0, 0, overlay_w - 1, overlay_h - 1,
+                                      outline="#007aff", width=2)
 
-        # 4c. Blue highlight border around the focused window
-        self.canvas.create_rectangle(
-            wx - 2, wy - 2, wx + ww + 2, wy + wh + 2,
-            outline="#007aff", width=2
-        )
-
-        # Draw a loader overlay
+        # Loader text
         self.loader_text = self.canvas.create_text(
-            monitor['width'] // 2, 
-            40, 
-            text="[ Freezing & Running OCR / Translation... ]", 
-            fill="#ffffff", 
-            font=("Segoe UI", 16, "bold"),
-            justify="center"
+            overlay_w // 2, 25,
+            text="[ Running OCR / Translation... ]",
+            fill="#ffffff", font=("Segoe UI", 14, "bold"), justify="center"
         )
-        # Background shadow for loader text
         self.canvas.create_rectangle(
-            monitor['width'] // 2 - 200, 15,
-            monitor['width'] // 2 + 200, 65,
-            fill="#1c1c1e", outline="#3a3a3c", width=2,
-            tags="loader_bg"
+            overlay_w // 2 - 160, 8, overlay_w // 2 + 160, 46,
+            fill="#1c1c1e", outline="#3a3a3c", width=2, tags="loader_bg"
         )
         self.canvas.tag_raise(self.loader_text)
 
-        # 5. Bind escape key to close the window
+        # 5. Bind escape key to close
         self.active_window.bind("<Escape>", lambda e: self.unfreeze_screen())
 
-        # 6. Bring window to the front and focus it
+        # 6. Bring overlay to front
         self.active_window.attributes("-topmost", True)
         self.active_window.focus_force()
 
-        # 7. Start background thread to process OCR & Translation (window crop only)
+        # 7. Start background thread for OCR & Translation
         threading.Thread(
             target=self.process_ocr,
             args=(self.pil_img, win_local),
@@ -274,12 +268,13 @@ class ScreenFreezerApp:
             )
             ocr_res = winocr.recognize_pil_sync(ocr_img, 'ja')
             lines = ocr_res.get('lines', [])
-            # Scale bboxes from OCR space -> win_crop space -> full-screen space
+            # Scale bboxes from OCR space -> overlay space (no offset needed;
+            # the crop area is exactly the overlay window area)
             for line in lines:
                 for word in line.get('words', []):
                     br = word['bounding_rect']
-                    br['x'] = br['x'] / OCR_SCALE + win_x
-                    br['y'] = br['y'] / OCR_SCALE + win_y
+                    br['x'] /= OCR_SCALE
+                    br['y'] /= OCR_SCALE
                     br['width']  /= OCR_SCALE
                     br['height'] /= OCR_SCALE
             
@@ -289,7 +284,7 @@ class ScreenFreezerApp:
             translation_targets = []
             for line in lines:
                 win_text = line.get('text', '').strip()
-                bbox = get_line_bounding_rect(line)  # now in full-screen coords
+                bbox = get_line_bounding_rect(line)  # now in overlay coords
 
                 # Collect word-level data for selectable regions
                 words_data = []
@@ -306,12 +301,12 @@ class ScreenFreezerApp:
                         })
 
                 if OCR_ENGINE == "manga":
-                    # Crop from the full-screen image using full-screen coords
+                    # Crop from full monitor image (offset overlay coords by win_x/y)
                     crop_pil = pil_img.crop((
-                        max(0, int(bbox['x'])),
-                        max(0, int(bbox['y'])),
-                        min(pil_img.width,  int(bbox['x'] + bbox['width'])),
-                        min(pil_img.height, int(bbox['y'] + bbox['height']))
+                        max(0, int(bbox['x'] + win_x)),
+                        max(0, int(bbox['y'] + win_y)),
+                        min(pil_img.width,  int(bbox['x'] + bbox['width'] + win_x)),
+                        min(pil_img.height, int(bbox['y'] + bbox['height'] + win_y))
                     ))
                     # Skip tiny/empty crops
                     if crop_pil.width < 4 or crop_pil.height < 4:
@@ -338,13 +333,13 @@ class ScreenFreezerApp:
                     bbox, crop_pil, words_data = futures[future]
                     try:
                         res = future.result()
-                        # For windows engine, crop now using full-screen coords
+                        # For windows engine, crop from full monitor image
                         if crop_pil is None:
                             crop_pil = pil_img.crop((
-                                max(0, int(bbox['x'])),
-                                max(0, int(bbox['y'])),
-                                min(pil_img.width,  int(bbox['x'] + bbox['width'])),
-                                min(pil_img.height, int(bbox['y'] + bbox['height']))
+                                max(0, int(bbox['x'] + win_x)),
+                                max(0, int(bbox['y'] + win_y)),
+                                min(pil_img.width,  int(bbox['x'] + bbox['width'] + win_x)),
+                                min(pil_img.height, int(bbox['y'] + bbox['height'] + win_y))
                             ))
                         
                         # Estimate width based on longest line of text or crop width
