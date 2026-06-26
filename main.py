@@ -148,9 +148,12 @@ class ScreenFreezerApp:
         self.previous_hwnd = None
         self.pil_img = None
         self.tk_img = None
+        self.overlay_hwnd = None
+        self.overlay_visible = True
         
         # Start checking the queue for trigger events or translation results
         self.root.after(100, self.check_queue)
+        self.root.after(500, self.check_focus)
 
     def check_queue(self):
         try:
@@ -166,6 +169,24 @@ class ScreenFreezerApp:
 
     def trigger(self):
         self.msg_queue.put(("trigger", None))
+
+    def check_focus(self):
+        if not self.active_window:
+            self.root.after(500, self.check_focus)
+            return
+
+        fg = user32.GetForegroundWindow()
+        # Hide overlay when neither the game nor the overlay is focused
+        if self.overlay_visible and fg not in (self.overlay_hwnd, self.previous_hwnd):
+            self.overlay_visible = False
+            self.active_window.withdraw()
+        # Re-show when the game (or overlay) becomes active again
+        elif not self.overlay_visible and fg in (self.overlay_hwnd, self.previous_hwnd):
+            self.active_window.deiconify()
+            self.active_window.attributes("-topmost", True)
+            self.overlay_visible = True
+
+        self.root.after(500, self.check_focus)
 
     def freeze_screen(self):
         if self.active_window is not None:
@@ -216,6 +237,11 @@ class ScreenFreezerApp:
 
         self.canvas = tk.Canvas(self.active_window, borderwidth=0, highlightthickness=0, bg="black")
         self.canvas.pack(fill="both", expand=True)
+
+        # Capture overlay HWND for focus tracking
+        self.active_window.update_idletasks()
+        self.overlay_hwnd = self.active_window.winfo_id()
+        self.overlay_visible = True
 
         # 4. Show only the cropped game window content as background
         bg_crop = self.pil_img.crop((win_local['x'], win_local['y'],
@@ -587,6 +613,8 @@ class ScreenFreezerApp:
         if self.active_window:
             self.active_window.destroy()
             self.active_window = None
+            self.overlay_hwnd = None
+            self.overlay_visible = True
             self.tk_img = None
             self.pil_img = None
             self.crop_tk_imgs = []
