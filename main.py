@@ -434,6 +434,7 @@ class ScreenFreezerApp:
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Button-3>", self.on_right_click)
+        self.canvas.bind("<Shift-Button-3>", self.on_shift_right_click)
         self.canvas.bind("<Button-2>", self.on_middle_click)
 
     def on_mouse_move(self, event):
@@ -598,7 +599,8 @@ class ScreenFreezerApp:
         words = self.ocr_boxes[self.selection_box_idx].get('words', [])
 
         if start == end:
-            # Click (no drag) → read the whole line aloud
+            # Click (no drag) → read the whole line aloud, no highlight
+            self.clear_selection_visuals()
             box_text = self.ocr_boxes[self.selection_box_idx]['data']['original']
             if box_text:
                 threading.Thread(target=self.read_aloud, args=(box_text,), daemon=True).start()
@@ -625,6 +627,12 @@ class ScreenFreezerApp:
         text = self.get_current_text()
         if text:
             url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
+            webbrowser.open(url)
+
+    def on_shift_right_click(self, event):
+        text = self.get_current_text()
+        if text:
+            url = f"https://www.deepl.com/en/translator#ja/en/{urllib.parse.quote(text)}"
             webbrowser.open(url)
 
     def on_middle_click(self, event):
