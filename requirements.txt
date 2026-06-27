@@ -4,3 +4,6 @@ winocr
 pykakasi
 deep-translator
 edge-tts
+paddleocr
+paddlepaddle
+onnxruntime

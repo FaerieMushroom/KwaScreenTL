@@ -1,14 +1,19 @@
 import ctypes
 import ctypes.wintypes
+import os
 import queue
-import time
 import re
 import threading
+import time
+
+# PaddlePaddle 3.3 PIR compatibility workaround — must be set before any
+# paddle/paddlex import, so it goes right at the top.
+os.environ["FLAGS_enable_pir_with_executor_in_serial_mode"] = "0"
 
 # ── OCR engine selector ──────────────────────────────────────────────────────
-# Currently only "windows" (WinOCR) is available.
-# Swap this var when adding new OCR backends.
-OCR_ENGINE = "windows"
+# "windows" → WinOCR (Windows.Media.Ocr, fast but less accurate)
+# "paddle"  → PaddleOCR (deep-learning, more accurate, ~5s first-load)
+OCR_ENGINE = "paddle"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Translation backend ──────────────────────────────────────────────────────
@@ -17,16 +22,33 @@ OCR_ENGINE = "windows"
 TRANSLATOR = "deepl"
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── OCR upscale factors (multi-scale fusion) ──────────────────────────────────
+# Multiple scales are tried and results merged.  Lower scales catch large text
+# with good word grouping; higher scales catch small/corner text.
+# Tweak these to balance speed vs coverage.
+OCR_SCALES = [5, 7]
+
+# ── Snip-mode OCR scale (Ctrl+Alt+Shift+R) ──────────────────────────────────
+# Scale used when drag-selecting a custom region.  Can be different from
+# OCR_SCALES since snips are often smaller areas (less memory pressure).
+SNIP_OCR_SCALE = 5
+
+# ── Language filter ─────────────────────────────────────────────────────────
+# When True, non-Japanese OCR text (numbers, English UI) is skipped.
+# Set to False to show everything (useful for debugging OCR coverage).
+SKIP_NON_JAPANESE = False
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Window capture crop (px to trim from captured window edges) ──────────────
 CROP_TOP = 30
 CROP_BOTTOM = 10
 CROP_LEFT = 10
 CROP_RIGHT = 10
 
-import os
 import tkinter as tk
 from PIL import Image, ImageTk
 import mss
+import onnxruntime  # must precede winocr to avoid WinRT DLL conflict
 import winocr
 import pykakasi
 from deep_translator import GoogleTranslator
@@ -48,6 +70,23 @@ def get_deepl_api_key():
             print(f"Failed to read DeepL API key from {key_path}: {e}")
             _deepl_api_key = ""
     return _deepl_api_key
+
+# ── PaddleOCR lazy loader ──────────────────────────────────────────────────
+_paddle_ocr = None
+
+def get_paddle_ocr():
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        from paddleocr import PaddleOCR
+        print("[PaddleOCR] Loading models... (first load may download ~200MB)")
+        _paddle_ocr = PaddleOCR(
+            lang='japan', engine='onnxruntime',
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+        print("[PaddleOCR] Ready.")
+    return _paddle_ocr
 
 def translate_deepl(text):
     import requests
@@ -173,6 +212,8 @@ class ScreenFreezerApp:
                 msg_type, data = self.msg_queue.get_nowait()
                 if msg_type == "trigger":
                     self.freeze_screen()
+                elif msg_type == "trigger_snip":
+                    self.enter_snip_mode()
                 elif msg_type == "ocr_complete":
                     self.display_translations(data)
         except queue.Empty:
@@ -181,6 +222,9 @@ class ScreenFreezerApp:
 
     def trigger(self):
         self.msg_queue.put(("trigger", None))
+
+    def trigger_snip(self):
+        self.msg_queue.put(("trigger_snip", None))
 
     def check_focus(self):
         if not self.active_window:
@@ -297,37 +341,248 @@ class ScreenFreezerApp:
             daemon=True
         ).start()
 
-    def process_ocr(self, pil_img, win_local):
-        """Run OCR on the focused window crop only, then offset boxes to screen coords."""
+    # ── Snip mode (drag-select region, Ctrl+Alt+Shift+R) ────────────────────
+
+    def enter_snip_mode(self):
+        if self.active_window:
+            return
+        sct_img, self.snip_monitor = capture_moused_monitor()
+        self.pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+        mw = self.snip_monitor['width']
+        mh = self.snip_monitor['height']
+        ml = self.snip_monitor['left']
+        mt = self.snip_monitor['top']
+
+        self.snip_window = tk.Toplevel(self.root)
+        self.snip_window.overrideredirect(True)
+        self.snip_window.geometry(f"{mw}x{mh}+{ml}+{mt}")
+
+        self.snip_canvas = tk.Canvas(self.snip_window, borderwidth=0, highlightthickness=0, bg="black")
+        self.snip_canvas.pack(fill="both", expand=True)
+
+        bg_tk = ImageTk.PhotoImage(self.pil_img)
+        self.snip_bg_tk = bg_tk
+        self.snip_canvas.create_image(0, 0, image=bg_tk, anchor="nw")
+
+        # Dim overlay
+        self.snip_canvas.create_rectangle(0, 0, mw, mh, fill="black", stipple="gray12", tags="dim")
+
+        self.snip_start = None
+        self.snip_rect_id = None
+        self.snip_canvas.bind("<Button-1>", self.snip_mouse_down)
+        self.snip_canvas.bind("<B1-Motion>", self.snip_mouse_drag)
+        self.snip_canvas.bind("<ButtonRelease-1>", self.snip_mouse_up)
+        self.snip_canvas.bind("<Escape>", lambda e: self._close_snip())
+
+        self.snip_window.attributes("-topmost", True)
+        self.snip_window.focus_force()
+
+    def _close_snip(self):
+        if self.snip_window:
+            self.snip_window.destroy()
+            self.snip_window = None
+            self.snip_canvas = None
+            self.snip_monitor = None
+            self.snip_bg_tk = None
+            self.snip_start = None
+            self.snip_rect_id = None
+
+    def snip_mouse_down(self, event):
+        self.snip_start = (event.x, event.y)
+
+    def snip_mouse_drag(self, event):
+        if not self.snip_start:
+            return
+        c = self.snip_canvas
+        if self.snip_rect_id:
+            c.delete(self.snip_rect_id)
+        x1, y1 = self.snip_start
+        x2, y2 = event.x, event.y
+        self.snip_rect_id = c.create_rectangle(
+            x1, y1, x2, y2, outline="#00ff00", width=3, tags="snip_sel"
+        )
+
+    def snip_mouse_up(self, event):
+        if not self.snip_start:
+            return
+        x1 = min(self.snip_start[0], event.x)
+        y1 = min(self.snip_start[1], event.y)
+        x2 = max(self.snip_start[0], event.x)
+        y2 = max(self.snip_start[1], event.y)
+        w, h = x2 - x1, y2 - y1
+        if w < 20 or h < 20:
+            self._close_snip()
+            return
+
+        # Convert canvas (monitor-local) coords to screen coords
+        ml = self.snip_monitor['left']
+        mt = self.snip_monitor['top']
+        screen_rect = (ml + x1, mt + y1, ml + x2, mt + y2)
+        self._close_snip()
+
+        self.freeze_screen_region(screen_rect)
+
+    def freeze_screen_region(self, screen_rect):
+        """Freeze a user-selected region (screen coords: left, top, right, bottom)."""
+        left, top, right, bottom = screen_rect
+        w, h = right - left, bottom - top
+
+        self.active_window = tk.Toplevel(self.root)
+        self.active_window.overrideredirect(True)
+        self.active_window.geometry(f"{w}x{h}+{left}+{top}")
+
+        self.canvas = tk.Canvas(self.active_window, borderwidth=0, highlightthickness=0, bg="black")
+        self.canvas.pack(fill="both", expand=True)
+
+        self.active_window.update_idletasks()
+        self.overlay_hwnd = user32.GetAncestor(self.active_window.winfo_id(), 2)
+        self.overlay_visible = True
+
+        # Crop the full image to the selected region
+        mx_off = self.snip_monitor['left']
+        my_off = self.snip_monitor['top']
+        win_local = {
+            'x': left - mx_off,
+            'y': top - my_off,
+            'w': w,
+            'h': h,
+        }
+
+        bg_crop = self.pil_img.crop((win_local['x'], win_local['y'],
+                                      win_local['x'] + w, win_local['y'] + h))
+        self.tk_img = ImageTk.PhotoImage(bg_crop)
+        self.canvas.create_image(0, 0, image=self.tk_img, anchor="nw")
+        self.canvas.create_rectangle(0, 0, w - 1, h - 1, outline="#007aff", width=2)
+
+        self.loader_text = self.canvas.create_text(
+            w // 2, 25,
+            text="[ Running OCR / Translation... ]",
+            fill="#ffffff", font=("Segoe UI", 14, "bold"), justify="center"
+        )
+        self.canvas.create_rectangle(
+            w // 2 - 160, 8, w // 2 + 160, 46,
+            fill="#1c1c1e", outline="#3a3a3c", width=2, tags="loader_bg"
+        )
+        self.canvas.tag_raise(self.loader_text)
+        self.active_window.bind("<Escape>", lambda e: self.unfreeze_screen())
+        self.active_window.attributes("-topmost", True)
+        self.active_window.focus_force()
+
+        threading.Thread(
+            target=self.process_ocr,
+            args=(self.pil_img, win_local, SNIP_OCR_SCALE),
+            daemon=True
+        ).start()
+
+    def run_ocr_paddle(self, win_crop):
+        """Run PaddleOCR on the crop, return lines in same format as run_ocr_at_scale."""
+        ocr = get_paddle_ocr()
+        import numpy as np
+        img_array = np.array(win_crop.convert("RGB"))
+        results = list(ocr.predict(img_array))
+        lines = []
+        if results:
+            r = results[0]
+            dt_polys = r.get('dt_polys', [])
+            rec_texts = r.get('rec_texts', [])
+            for poly, text in zip(dt_polys, rec_texts):
+                text = re.sub(r'\s+', '', text).strip()
+                if not text:
+                    continue
+                xs = [int(p[0]) for p in poly]
+                ys = [int(p[1]) for p in poly]
+                bbox = {
+                    'x': min(xs),
+                    'y': min(ys),
+                    'width': max(xs) - min(xs),
+                    'height': max(ys) - min(ys)
+                }
+                lines.append({
+                    'text': text,
+                    'words': [{'text': text, 'bounding_rect': bbox}]
+                })
+        return lines
+
+    def run_ocr_at_scale(self, win_crop, scale):
+        """Run WinOCR at a given scale factor, return lines with bboxes in overlay coords."""
+        ocr_img = win_crop.resize(
+            (win_crop.width * scale, win_crop.height * scale),
+            Image.LANCZOS
+        )
+        ocr_res = winocr.recognize_pil_sync(ocr_img, 'ja')
+        lines = ocr_res.get('lines', [])
+        for line in lines:
+            for word in line.get('words', []):
+                br = word['bounding_rect']
+                br['x'] /= scale
+                br['y'] /= scale
+                br['width'] /= scale
+                br['height'] /= scale
+        return lines
+
+    def merge_lines(self, *line_sets):
+        """Merge lines from multiple OCR passes, keeping the best text per region."""
+        def iou(a, b):
+            x1 = max(a['x'], b['x'])
+            y1 = max(a['y'], b['y'])
+            x2 = min(a['x'] + a['width'], b['x'] + b['width'])
+            y2 = min(a['y'] + a['height'], b['y'] + b['height'])
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+            inter = (x2 - x1) * (y2 - y1)
+            u = a['width'] * a['height'] + b['width'] * b['height'] - inter
+            return inter / u if u else 0.0
+
+        merged = []
+        for lines in line_sets:
+            for line in lines:
+                bbox = get_line_bounding_rect(line)
+                text = line.get('text', '').strip()
+                text_clean = re.sub(r'\s+', '', text)
+                if not text_clean:
+                    continue
+                if SKIP_NON_JAPANESE and not contains_japanese(text_clean):
+                    continue
+
+                # Check overlap with existing merged lines
+                found = False
+                for i, existing in enumerate(merged):
+                    eb = existing['bbox']
+                    if iou(bbox, eb) > 0.3:
+                        # Keep the line with longer text (more complete)
+                        existing_text = existing['line'].get('text', '').strip()
+                        existing_clean = re.sub(r'\s+', '', existing_text)
+                        if len(text_clean) > len(existing_clean):
+                            merged[i] = {'line': line, 'bbox': bbox}
+                        found = True
+                        break
+                if not found:
+                    merged.append({'line': line, 'bbox': bbox})
+        return [m['line'] for m in merged]
+
+    def process_ocr(self, pil_img, win_local, single_scale=None):
+        """Run OCR on the focused window crop only, then offset boxes to screen coords.
+           If single_scale is set, runs one pass at that scale (snip mode)."""
         win_x, win_y = win_local['x'], win_local['y']
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
         
-        OCR_SCALE = 2
         try:
-            # Upscale the focused window crop for better OCR accuracy
-            ocr_img = win_crop.resize(
-                (win_crop.width * OCR_SCALE, win_crop.height * OCR_SCALE),
-                Image.LANCZOS
-            )
-            ocr_res = winocr.recognize_pil_sync(ocr_img, 'ja')
-            lines = ocr_res.get('lines', [])
-            # Scale bboxes from OCR space -> overlay space (no offset needed;
-            # the crop area is exactly the overlay window area)
-            for line in lines:
-                for word in line.get('words', []):
-                    br = word['bounding_rect']
-                    br['x'] /= OCR_SCALE
-                    br['y'] /= OCR_SCALE
-                    br['width']  /= OCR_SCALE
-                    br['height'] /= OCR_SCALE
+            engine = globals().get("OCR_ENGINE", "windows")
+            if engine == "paddle":
+                lines = self.run_ocr_paddle(win_crop)
+            else:
+                SCALES = [single_scale] if single_scale else globals().get("OCR_SCALES", [3, 7])
+                lines = self.merge_lines(
+                    *(self.run_ocr_at_scale(win_crop, s) for s in SCALES)
+                )
             
             translation_targets = []
             for line in lines:
                 text = line.get('text', '').strip()
                 print(f"[OCR RAW] '{text}'")
-                bbox = get_line_bounding_rect(line)  # now in overlay coords
+                bbox = get_line_bounding_rect(line)
 
-                # Collect word-level data for selectable regions
                 words_data = []
                 for word in line.get('words', []):
                     br = word['bounding_rect']
@@ -342,12 +597,11 @@ class ScreenFreezerApp:
                         })
 
                 crop_pil = None
-
                 text = text.strip()
-                # Windows OCR often inserts spaces between Japanese characters;
-                # remove them so the translator receives clean text.
                 text = re.sub(r'\s+', '', text)
-                if not text or not contains_japanese(text):
+                if not text:
+                    continue
+                if SKIP_NON_JAPANESE and not contains_japanese(text):
                     print(f"[OCR SKIP] '{text}' (no Japanese chars)")
                     continue
                 translation_targets.append((text, bbox, crop_pil, words_data))
@@ -709,10 +963,14 @@ def register_hotkey_win32(app):
     msg = ctypes.wintypes.MSG()
     user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # PM_NOREMOVE
 
-    HOTKEY_ID = 1
     mods = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT
+    HK_CAPTURE = 1  # Ctrl+Alt+Shift+E
+    HK_SNIP    = 2  # Ctrl+Alt+Shift+R
 
-    if not user32.RegisterHotKey(None, HOTKEY_ID, mods, ord('E')):
+    reg_ok = user32.RegisterHotKey(None, HK_CAPTURE, mods, ord('E'))
+    reg_ok = user32.RegisterHotKey(None, HK_SNIP,    mods, ord('R')) and reg_ok
+
+    if not reg_ok:
         err = ctypes.get_last_error()
         print(f"[DEBUG] RegisterHotKey failed with error {err}. Falling back to GetAsyncKeyState polling.")
 
@@ -721,30 +979,39 @@ def register_hotkey_win32(app):
             return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
         VK_MAP = {
-            "ctrl":  (0xA2, 0xA3),   # L/R CONTROL
-            "alt":   (0xA4, 0xA5),   # L/R MENU (Alt)
-            "shift": (0xA0, 0xA1),   # L/R SHIFT
+            "ctrl":  (0xA2, 0xA3),
+            "alt":   (0xA4, 0xA5),
+            "shift": (0xA0, 0xA1),
             "e":     (0x45, None),
+            "r":     (0x52, None),
         }
-        pressed = False
+        pressed_e = False
+        pressed_r = False
         while True:
             ctrl  = is_key_down(VK_MAP["ctrl"][0])  or is_key_down(VK_MAP["ctrl"][1])
             alt   = is_key_down(VK_MAP["alt"][0])   or is_key_down(VK_MAP["alt"][1])
             shift = is_key_down(VK_MAP["shift"][0]) or is_key_down(VK_MAP["shift"][1])
-            e     = is_key_down(VK_MAP["e"][0])
-            if ctrl and alt and shift and e:
-                if not pressed:
-                    pressed = True
+            if ctrl and alt and shift and is_key_down(VK_MAP["e"][0]):
+                if not pressed_e:
+                    pressed_e = True
                     app.trigger()
+            elif ctrl and alt and shift and is_key_down(VK_MAP["r"][0]):
+                if not pressed_r:
+                    pressed_r = True
+                    app.trigger_snip()
             else:
-                pressed = False
+                pressed_e = False
+                pressed_r = False
             time.sleep(0.05)
         return
 
     print("[DEBUG] RegisterHotKey succeeded – waiting for WM_HOTKEY.")
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
-        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-            app.trigger()
+        if msg.message == WM_HOTKEY:
+            if msg.wParam == HK_CAPTURE:
+                app.trigger()
+            elif msg.wParam == HK_SNIP:
+                app.trigger_snip()
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -754,8 +1021,10 @@ def main():
     # Start Win32 hotkey thread (RegisterHotKey with fallback to GetAsyncKeyState)
     threading.Thread(target=register_hotkey_win32, args=(app,), daemon=True).start()
 
-    print("Application started. Press Ctrl+Alt+Shift+E to freeze and translate.")
-    print("Press Escape while frozen to unfreeze and restore focus.")
+    print("Application started.")
+    print("  Ctrl+Alt+Shift+E  Capture game window for OCR / translation")
+    print("  Ctrl+Alt+Shift+R  Snip mode (drag-select a region)")
+    print("  Press Escape while frozen to unfreeze and restore focus.")
 
     try:
         app.run()
