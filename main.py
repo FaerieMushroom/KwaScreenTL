@@ -164,7 +164,8 @@ def translate_and_convert(japanese_text):
         'original': japanese_text,
         'romaji': romaji,
         'kana': kana,
-        'english': english
+        'english': english,
+        'kakasi_items': result,
     }
 
 def get_line_bounding_rect(line):
@@ -684,6 +685,8 @@ class ScreenFreezerApp:
         self.selection_start = -1
         self.selection_end = -1
         self.selection_overlays = []
+        self._hover_kana_text = None
+        self._hover_romaji_text = None
 
         for box in boxes:
             orig = box['orig_bbox']
@@ -722,6 +725,10 @@ class ScreenFreezerApp:
             self.current_hover_idx = hover_idx
             if hover_idx >= 0:
                 self.show_hover_translation(self.ocr_boxes[hover_idx])
+        elif hover_idx >= 0:
+            wi = self.get_word_at_pos(hover_idx, event.x, event.y)
+            if wi >= 0:
+                self.update_hover_highlights(self.ocr_boxes[hover_idx], wi)
 
     def clear_hover_translation(self):
         if self.hover_window_id:
@@ -730,6 +737,8 @@ class ScreenFreezerApp:
         for ref in self.highlight_refs:
             self.canvas.itemconfig(ref, outline="#007aff", width=2)
         self.current_hover_idx = -1
+        self._hover_kana_text = None
+        self._hover_romaji_text = None
 
     def show_hover_translation(self, box):
         data = box['data']
@@ -769,18 +778,80 @@ class ScreenFreezerApp:
         tk.Label(frame, text=data['original'], fg="#a31515", bg="#ffffff",
                  font=("Segoe UI", 11, "bold"), anchor="w", justify="left"
                  ).pack(fill="x", pady=(0, 2))
-        tk.Label(frame, text=data['kana'], fg="#248a3d", bg="#ffffff",
-                 font=("Segoe UI", 10, "normal"), anchor="w", justify="left"
-                 ).pack(fill="x", pady=(0, 2))
-        tk.Label(frame, text=data['romaji'], fg="#0066cc", bg="#ffffff",
-                 font=("Segoe UI", 9, "italic"), anchor="w", justify="left"
-                 ).pack(fill="x", pady=(0, 2))
+        self._hover_kana_text = tk.Text(
+            frame, height=1, wrap="none", bd=0, highlightthickness=0,
+            bg="#ffffff", fg="#248a3d",
+            font=("Segoe UI", 10, "normal"),
+        )
+        self._hover_kana_text.insert("1.0", data['kana'])
+        self._hover_kana_text.tag_config("hl", background="#fff3a8")
+        self._hover_kana_text.config(state="disabled")
+        self._hover_kana_text.pack(fill="x", pady=(0, 2))
+
+        self._hover_romaji_text = tk.Text(
+            frame, height=1, wrap="none", bd=0, highlightthickness=0,
+            bg="#ffffff", fg="#0066cc",
+            font=("Segoe UI", 9, "italic"),
+        )
+        self._hover_romaji_text.insert("1.0", data['romaji'])
+        self._hover_romaji_text.tag_config("hl", background="#fff3a8")
+        self._hover_romaji_text.config(state="disabled")
+        self._hover_romaji_text.pack(fill="x", pady=(0, 2))
         tk.Label(frame, text=data['english'], fg="#1c1c1e", bg="#ffffff",
                  font=("Segoe UI", 11, "bold"), anchor="w", justify="left",
                  wraplength=w - 16
                  ).pack(fill="x")
 
         self.hover_window_id = self.canvas.create_window(x, y, window=frame, anchor="nw")
+
+    def _build_item_ranges(self, items):
+        """Build char→kana and char→romaji index ranges from pykakasi items."""
+        kana_ranges = []
+        romaji_ranges = []
+        kana_off = 0
+        romaji_off = 0
+        char_off = 0
+        for idx, item in enumerate(items):
+            orig = item.get('orig', '')
+            orig_len = len(orig)
+            kana_t = item.get('hira') or orig
+            romaji_t = item.get('hepburn', '')
+            kana_ranges.append({
+                'char_start': char_off, 'char_end': char_off + orig_len,
+                'text_start': kana_off, 'text_end': kana_off + len(kana_t),
+            })
+            romaji_ranges.append({
+                'char_start': char_off, 'char_end': char_off + orig_len,
+                'text_start': romaji_off, 'text_end': romaji_off + len(romaji_t),
+            })
+            char_off += orig_len
+            kana_off += len(kana_t)
+            romaji_off += len(romaji_t)
+            if idx < len(items) - 1:
+                kana_off += 1
+                romaji_off += 1
+        return kana_ranges, romaji_ranges
+
+    def _clear_hover_tags(self):
+        for tw in (self._hover_kana_text, self._hover_romaji_text):
+            if tw:
+                tw.tag_remove("hl", "1.0", "end")
+
+    def update_hover_highlights(self, box, char_idx):
+        """Highlight kana/romaji ranges that correspond to the hovered character."""
+        self._clear_hover_tags()
+        if char_idx < 0:
+            return
+        items = box['data'].get('kakasi_items', [])
+        if not items:
+            return
+        kana_ranges, romaji_ranges = self._build_item_ranges(items)
+        for kr, rr in zip(kana_ranges, romaji_ranges):
+            if kr['char_start'] <= char_idx < kr['char_end']:
+                if self._hover_kana_text:
+                    self._hover_kana_text.tag_add("hl", f"1.{kr['text_start']}", f"1.{kr['text_end']}")
+                if self._hover_romaji_text:
+                    self._hover_romaji_text.tag_add("hl", f"1.{rr['text_start']}", f"1.{rr['text_end']}")
 
     # ── Word-level selection & clipboard ──────────────────────────────────────
 
