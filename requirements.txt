@@ -3,5 +3,4 @@ pillow
 winocr
 pykakasi
 deep-translator
-manga-ocr
 edge-tts

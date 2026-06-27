@@ -6,9 +6,15 @@ import re
 import threading
 
 # ── OCR engine selector ──────────────────────────────────────────────────────
-# Set to "manga" for manga-ocr (best accuracy, uses ML model, slower first run)
-# Set to "windows" for Windows Native OCR (fast, no extra model download)
+# Currently only "windows" (WinOCR) is available.
+# Swap this var when adding new OCR backends.
 OCR_ENGINE = "windows"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Translation backend ──────────────────────────────────────────────────────
+# "google"  → Google Translate (online, free, no key needed)
+# "deepl"   → DeepL API  (online, needs key in deeplapikey.txt)
+TRANSLATOR = "deepl"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Window capture crop (px to trim from captured window edges) ──────────────
@@ -16,13 +22,6 @@ CROP_TOP = 30
 CROP_BOTTOM = 10
 CROP_LEFT = 10
 CROP_RIGHT = 10
-
-# torch MUST be imported before tkinter on Windows to avoid c10.dll WinError 1114
-if OCR_ENGINE == "manga":
-    try:
-        import torch  # noqa: F401 - side-effect import fixes DLL load order
-    except Exception:
-        pass
 
 import os
 import tkinter as tk
@@ -35,28 +34,35 @@ from concurrent.futures import ThreadPoolExecutor
 import webbrowser
 import urllib.parse
 
-# Lazy-initialised manga-ocr instance (loaded only if OCR_ENGINE == "manga")
-_manga_ocr = None
-_manga_ocr_lock = threading.Lock()
+# ── DeepL API key loader ───────────────────────────────────────────────────
+_deepl_api_key = None
 
-def get_manga_ocr():
-    global _manga_ocr
-    if _manga_ocr is None:
-        with _manga_ocr_lock:
-            if _manga_ocr is None:
-                from manga_ocr import MangaOcr
-                _manga_ocr = MangaOcr()
-    return _manga_ocr
-
-def prewarm_manga_ocr():
-    """Load manga-ocr model in background so first hotkey press is instant."""
-    if OCR_ENGINE == "manga":
+def get_deepl_api_key():
+    global _deepl_api_key
+    if _deepl_api_key is None:
+        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deeplapikey.txt")
         try:
-            get_manga_ocr()
-            print("manga-ocr model loaded and ready.")
+            with open(key_path, "r") as f:
+                _deepl_api_key = f.read().strip()
         except Exception as e:
-            print(f"manga-ocr failed to pre-load: {e}")
+            print(f"Failed to read DeepL API key from {key_path}: {e}")
+            _deepl_api_key = ""
+    return _deepl_api_key
 
+def translate_deepl(text):
+    import requests
+    key = get_deepl_api_key()
+    if not key:
+        return "[DeepL: no API key - add to deeplapikey.txt]"
+    resp = requests.post(
+        "https://api-free.deepl.com/v2/translate",
+        headers={"Authorization": f"DeepL-Auth-Key {key}"},
+        json={"text": [text], "source_lang": "JA", "target_lang": "EN"}
+    )
+    if resp.status_code == 403:
+        return "[DeepL: Unauthorized - check your API key]"
+    resp.raise_for_status()
+    return resp.json()["translations"][0]["text"]
 
 # Win32 structures for mouse cursor position
 class POINT(ctypes.Structure):
@@ -96,6 +102,7 @@ def contains_japanese(text):
 
 def translate_and_convert(japanese_text):
     """Convert Japanese to Romaji, Hiragana, and English translation."""
+    print(f"[TRANSLATE] input='{japanese_text}'")
     try:
         # Get PyKakasi conversions
         result = kks.convert(japanese_text)
@@ -103,8 +110,11 @@ def translate_and_convert(japanese_text):
         # hira contains hiragana, but we fallback to orig for symbols/numbers
         kana = " ".join([item['hira'] if item['hira'] else item['orig'] for item in result])
         
-        # Translate to English — create a fresh instance per call (thread-safe)
-        english = GoogleTranslator(source='ja', target='en').translate(japanese_text)
+        # Translate to English
+        if TRANSLATOR == "deepl":
+            english = translate_deepl(japanese_text)
+        else:
+            english = GoogleTranslator(source='ja', target='en').translate(japanese_text)
     except Exception as e:
         romaji = "[Error]"
         kana = japanese_text
@@ -292,7 +302,7 @@ class ScreenFreezerApp:
         win_x, win_y = win_local['x'], win_local['y']
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
         
-        OCR_SCALE = 5
+        OCR_SCALE = 2
         try:
             # Upscale the focused window crop for better OCR accuracy
             ocr_img = win_crop.resize(
@@ -311,12 +321,10 @@ class ScreenFreezerApp:
                     br['width']  /= OCR_SCALE
                     br['height'] /= OCR_SCALE
             
-            # Prepare targets — Windows OCR provides bounding boxes for layout.
-            # If using manga-ocr, we still use Windows boxes but replace the text
-            # with manga-ocr's superior recognition on each crop.
             translation_targets = []
             for line in lines:
-                win_text = line.get('text', '').strip()
+                text = line.get('text', '').strip()
+                print(f"[OCR RAW] '{text}'")
                 bbox = get_line_bounding_rect(line)  # now in overlay coords
 
                 # Collect word-level data for selectable regions
@@ -333,25 +341,14 @@ class ScreenFreezerApp:
                             'height': br['height']
                         })
 
-                if OCR_ENGINE == "manga":
-                    # Crop from full monitor image (offset overlay coords by win_x/y)
-                    crop_pil = pil_img.crop((
-                        max(0, int(bbox['x'] + win_x)),
-                        max(0, int(bbox['y'] + win_y)),
-                        min(pil_img.width,  int(bbox['x'] + bbox['width'] + win_x)),
-                        min(pil_img.height, int(bbox['y'] + bbox['height'] + win_y))
-                    ))
-                    # Skip tiny/empty crops
-                    if crop_pil.width < 4 or crop_pil.height < 4:
-                        continue
-                    mocr = get_manga_ocr()
-                    text = mocr(crop_pil)
-                else:
-                    text = win_text
-                    crop_pil = None
+                crop_pil = None
 
                 text = text.strip()
+                # Windows OCR often inserts spaces between Japanese characters;
+                # remove them so the translator receives clean text.
+                text = re.sub(r'\s+', '', text)
                 if not text or not contains_japanese(text):
+                    print(f"[OCR SKIP] '{text}' (no Japanese chars)")
                     continue
                 translation_targets.append((text, bbox, crop_pil, words_data))
 
@@ -383,6 +380,7 @@ class ScreenFreezerApp:
                         # Estimate height including cropped image height
                         h = bbox['height'] + 110 + (len(res['english']) // 40) * 16
                         
+                        print(f"[RESULT] orig='{res['original']}' english='{res['english']}'")
                         boxes.append({
                             'w': w,
                             'h': h,
@@ -758,9 +756,6 @@ def main():
 
     print("Application started. Press Ctrl+Alt+Shift+E to freeze and translate.")
     print("Press Escape while frozen to unfreeze and restore focus.")
-
-    # Pre-warm the manga-ocr model in the background so first use is instant
-    threading.Thread(target=prewarm_manga_ocr, daemon=True).start()
 
     try:
         app.run()
