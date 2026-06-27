@@ -687,6 +687,8 @@ class ScreenFreezerApp:
         self.selection_overlays = []
         self._hover_kana_text = None
         self._hover_romaji_text = None
+        self._hover_word_idx = -1
+        self._hover_overlay_items = []
 
         for box in boxes:
             orig = box['orig_bbox']
@@ -727,8 +729,10 @@ class ScreenFreezerApp:
                 self.show_hover_translation(self.ocr_boxes[hover_idx])
         elif hover_idx >= 0:
             wi = self.get_word_at_pos(hover_idx, event.x, event.y)
-            if wi >= 0:
+            if wi >= 0 and wi != self._hover_word_idx:
+                self._hover_word_idx = wi
                 self.update_hover_highlights(self.ocr_boxes[hover_idx], wi)
+                self._show_hover_overlay_highlight(hover_idx, wi)
 
     def clear_hover_translation(self):
         if self.hover_window_id:
@@ -739,6 +743,8 @@ class ScreenFreezerApp:
         self.current_hover_idx = -1
         self._hover_kana_text = None
         self._hover_romaji_text = None
+        self._hover_word_idx = -1
+        self._clear_hover_overlay()
 
     def show_hover_translation(self, box):
         data = box['data']
@@ -784,7 +790,7 @@ class ScreenFreezerApp:
             font=("Segoe UI", 10, "normal"),
         )
         self._hover_kana_text.insert("1.0", data['kana'])
-        self._hover_kana_text.tag_config("hl", background="#fff3a8")
+        self._hover_kana_text.tag_config("hl", background="#ffcc00")
         self._hover_kana_text.config(state="disabled")
         self._hover_kana_text.pack(fill="x", pady=(0, 2))
 
@@ -794,7 +800,7 @@ class ScreenFreezerApp:
             font=("Segoe UI", 9, "italic"),
         )
         self._hover_romaji_text.insert("1.0", data['romaji'])
-        self._hover_romaji_text.tag_config("hl", background="#fff3a8")
+        self._hover_romaji_text.tag_config("hl", background="#ffcc00")
         self._hover_romaji_text.config(state="disabled")
         self._hover_romaji_text.pack(fill="x", pady=(0, 2))
         tk.Label(frame, text=data['english'], fg="#1c1c1e", bg="#ffffff",
@@ -831,6 +837,44 @@ class ScreenFreezerApp:
                 kana_off += 1
                 romaji_off += 1
         return kana_ranges, romaji_ranges
+
+    def _clear_hover_overlay(self):
+        for item in self._hover_overlay_items:
+            self.canvas.delete(item)
+        self._hover_overlay_items = []
+
+    def _show_hover_overlay_highlight(self, box_idx, word_idx):
+        self._clear_hover_overlay()
+        box = self.ocr_boxes[box_idx]
+        items = box['data'].get('kakasi_items', [])
+        if not items:
+            return
+        kana_ranges, _ = self._build_item_ranges(items)
+        chunk_chars = None
+        for kr in kana_ranges:
+            if kr['char_start'] <= word_idx < kr['char_end']:
+                chunk_chars = (kr['char_start'], kr['char_end'])
+                break
+        if not chunk_chars:
+            return
+        words = box.get('words', [])
+        xs, ys = [], []
+        for wi in range(chunk_chars[0], chunk_chars[1]):
+            if wi < len(words):
+                w = words[wi]
+                xs.append(w['x'])
+                xs.append(w['x'] + w['width'])
+                ys.append(w['y'])
+                ys.append(w['y'] + w['height'])
+        if not xs:
+            return
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        item = self.canvas.create_rectangle(
+            x1, y1, x2, y2,
+            fill="#ffcc00", stipple="gray25", outline=""
+        )
+        self._hover_overlay_items.append(item)
 
     def _clear_hover_tags(self):
         for tw in (self._hover_kana_text, self._hover_romaji_text):
