@@ -84,6 +84,7 @@ def get_paddle_ocr():
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            return_word_box=True,
         )
         print("[PaddleOCR] Ready.")
     return _paddle_ocr
@@ -498,9 +499,22 @@ class ScreenFreezerApp:
                     'width': max(xs) - min(xs),
                     'height': max(ys) - min(ys)
                 }
+                chars = list(text)
+                cw = bbox['width'] / max(len(chars), 1)
+                words = []
+                for ci, ch in enumerate(chars):
+                    words.append({
+                        'text': ch,
+                        'bounding_rect': {
+                            'x': bbox['x'] + int(ci * cw),
+                            'y': bbox['y'],
+                            'width': int(cw),
+                            'height': bbox['height'],
+                        }
+                    })
                 lines.append({
                     'text': text,
-                    'words': [{'text': text, 'bounding_rect': bbox}]
+                    'words': words,
                 })
         return lines
 
