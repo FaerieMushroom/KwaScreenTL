@@ -927,28 +927,41 @@ class ScreenFreezerApp:
         y = max(0, min(y, screen_h - h))
 
         kf = tkfont.Font(family=self.japanese_font, size=self.japanese_font_size, weight="bold")
+        en_font = tkfont.Font(family="Segoe UI", size=self.font_size_en, weight="bold")
         ki = data.get('kakasi_items', [])
         full_text = ''.join(it['orig'] for it in ki)
         pad_x = 6
         # y positions within the card
         card_y = y
-        line_y = card_y + 27  # same as tw.winfo_y() — pady(3)+pack pady(24)+internal
+
+        # Calculate card height based on visible content
+        if self.show_crop:
+            crop_tk = ImageTk.PhotoImage(crop_pil)
+            self.crop_tk_imgs.append(crop_tk)
+            ih = crop_tk.height()
+            line_y = card_y + 3 + ih + 24
+        else:
+            line_y = card_y + 27
+        line_h = max(30, kf.metrics("linespace"))
+        romaji_y = line_y + line_h + 2
+        eng_y = romaji_y + 18 if self.show_romaji else line_y + line_h
+        est_chars_per_line = max(1, (w - 16) // 7)
+        en_lines = max(1, -(-len(data['english']) // est_chars_per_line))
+        en_line_h = en_font.metrics("linespace")
+        en_height = en_lines * en_line_h
+        card_h = eng_y + en_height + 3 - card_y
 
         # Background card
         self._hover_card_items.append(self.canvas.create_rectangle(
-            x, card_y, x + w, card_y + h,
+            x, card_y, x + w, card_y + card_h,
             fill="#ffffff", outline="#e5e5ea", width=1
         ))
 
         # Crop image
         if self.show_crop:
-            crop_tk = ImageTk.PhotoImage(crop_pil)
-            self.crop_tk_imgs.append(crop_tk)
-            ih = crop_tk.height()
             self._hover_card_items.append(self.canvas.create_image(
                 x + 5, card_y + 3, image=crop_tk, anchor="nw"
             ))
-            line_y = card_y + 3 + ih + 24  # image bottom + pady=(0,22) + frame pady(2)
 
         # Furigana + original text (use font measurement so no widget layout needed)
         self._hover_kakasi_items = ki
@@ -985,11 +998,7 @@ class ScreenFreezerApp:
             fill="#a31515", anchor="nw"
         ))
 
-        # Line height for 22pt text
-        line_h = max(30, kf.metrics("linespace"))
-
         # Romaji text
-        romaji_y = line_y + line_h + 2
         if self.show_romaji:
             self._hover_card_items.append(self.canvas.create_text(
                 x + pad_x, romaji_y, text=data['romaji'],
@@ -998,7 +1007,6 @@ class ScreenFreezerApp:
             ))
 
         # English text
-        eng_y = romaji_y + 18 if self.show_romaji else line_y + line_h
         self._hover_card_items.append(self.canvas.create_text(
             x + pad_x, eng_y, text=data['english'],
             font=("Segoe UI", self.font_size_en, "bold"),
