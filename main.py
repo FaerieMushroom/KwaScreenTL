@@ -46,6 +46,11 @@ CROP_BOTTOM = 10
 CROP_LEFT = 10
 CROP_RIGHT = 10
 
+FONT_CHOICES = ["Yu Gothic UI", "Yu Gothic", "Meiryo", "MS Gothic", "MS Mincho", "Segoe UI"]
+DEFAULT_FONT = "Yu Gothic UI"
+FONT_SIZES = [16, 18, 20, 22, 24, 26, 28, 32]
+DEFAULT_FONT_SIZE = 22
+
 import tkinter as tk
 from PIL import Image, ImageTk
 import mss
@@ -207,6 +212,9 @@ class ScreenFreezerApp:
         self.current_hover_idx = -1
         self.ocr_boxes = []
         self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+        self.japanese_font = DEFAULT_FONT
+        self.japanese_font_size = DEFAULT_FONT_SIZE
+        self.font_size_en = 11
         self._load_settings()
         self._settings_window = None
         
@@ -221,6 +229,9 @@ class ScreenFreezerApp:
                 data = json.load(f)
             for k, v in defaults.items():
                 setattr(self, k, data.get(k, v))
+            self.japanese_font = data.get("japanese_font", DEFAULT_FONT)
+            self.japanese_font_size = data.get("japanese_font_size", DEFAULT_FONT_SIZE)
+            self.font_size_en = data.get("font_size_en", 11)
         except (FileNotFoundError, json.JSONDecodeError):
             for k, v in defaults.items():
                 setattr(self, k, v)
@@ -230,6 +241,9 @@ class ScreenFreezerApp:
             "show_crop": self.show_crop,
             "show_romaji": self.show_romaji,
             "skip_non_japanese": self.skip_non_japanese,
+            "japanese_font": self.japanese_font,
+            "japanese_font_size": self.japanese_font_size,
+            "font_size_en": self.font_size_en,
         }
         with open(self._settings_file, "w") as f:
             json.dump(data, f)
@@ -266,7 +280,6 @@ class ScreenFreezerApp:
             return
         win = tk.Toplevel(self.root)
         win.title("Settings")
-        win.geometry("260x180")
         win.resizable(False, False)
         win.attributes("-topmost", True)
         self._settings_window = win
@@ -289,6 +302,21 @@ class ScreenFreezerApp:
             self.skip_non_japanese = self._skip_nj_var.get()
             self._save_settings()
 
+        def on_font_change(*_):
+            self.japanese_font = self._font_var.get()
+            self._save_settings()
+            self._refresh_hover_card()
+
+        def on_font_size_change(*_):
+            self.japanese_font_size = int(self._font_size_var.get())
+            self._save_settings()
+            self._refresh_hover_card()
+
+        def on_font_size_en_change(*_):
+            self.font_size_en = int(self._font_size_en_var.get())
+            self._save_settings()
+            self._refresh_hover_card()
+
         pad = {"padx": 12, "pady": 3}
         tk.Label(win, text="Hover Card", font=("Segoe UI", 9, "bold"),
                  anchor="w").pack(fill="x", padx=12, pady=(10, 2))
@@ -305,6 +333,40 @@ class ScreenFreezerApp:
         sep2.pack(fill="x", padx=12)
         tk.Checkbutton(win, text="Skip non-Japanese text", variable=self._skip_nj_var,
                        command=on_skip_nj_toggle).pack(anchor="w", **pad)
+
+        tk.Label(win, text="Japanese Font", font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        sep3 = tk.Frame(win, height=1, bg="#c0c0c0")
+        sep3.pack(fill="x", padx=12)
+        self._font_var = tk.StringVar(value=self.japanese_font)
+        self._font_var.trace("w", on_font_change)
+        om = tk.OptionMenu(win, self._font_var, *FONT_CHOICES)
+        om.config(width=20)
+        om.pack(anchor="w", **pad)
+
+        tk.Label(win, text="Font Size (pt)", font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        sep4 = tk.Frame(win, height=1, bg="#c0c0c0")
+        sep4.pack(fill="x", padx=12)
+        self._font_size_var = tk.StringVar(value=str(self.japanese_font_size))
+        self._font_size_var.trace("w", on_font_size_change)
+        om2 = tk.OptionMenu(win, self._font_size_var, *[str(s) for s in FONT_SIZES])
+        om2.config(width=20)
+        om2.pack(anchor="w", **pad)
+
+        tk.Label(win, text="Font Size EN (pt)", font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        sep5 = tk.Frame(win, height=1, bg="#c0c0c0")
+        sep5.pack(fill="x", padx=12)
+        self._font_size_en_var = tk.StringVar(value=str(self.font_size_en))
+        self._font_size_en_var.trace("w", on_font_size_en_change)
+        EN_FONT_SIZES = [9, 10, 11, 12, 13, 14, 16, 18]
+        om3 = tk.OptionMenu(win, self._font_size_en_var, *[str(s) for s in EN_FONT_SIZES])
+        om3.config(width=20)
+        om3.pack(anchor="w", **pad)
+
+        win.update_idletasks()
+        win.geometry(f"{win.winfo_reqwidth()}x{win.winfo_reqheight()}")
 
         win.protocol("WM_DELETE_WINDOW", lambda: (
             setattr(self, '_settings_window', None), win.destroy()
@@ -734,7 +796,7 @@ class ScreenFreezerApp:
                         w = min(max(text_w, bbox['width'] + 24, 180), 400)
                         
                         # Estimate height including cropped image height
-                        h = bbox['height'] + 110 + (len(res['english']) // 40) * 16
+                        h = bbox['height'] + 130 + (len(res['english']) // 40) * 16
                         
                         print(f"[RESULT] orig='{res['original']}' english='{res['english']}'")
                         boxes.append({
@@ -773,7 +835,6 @@ class ScreenFreezerApp:
         self.selection_end = -1
         self.selection_overlays = []
         self._hover_original_text = None
-        self._hover_kana_text = None
         self._hover_romaji_text = None
         self._hover_word_idx = -1
         self._hover_overlay_items = []
@@ -830,7 +891,6 @@ class ScreenFreezerApp:
             self.canvas.itemconfig(ref, outline="#007aff", width=2)
         self.current_hover_idx = -1
         self._hover_original_text = None
-        self._hover_kana_text = None
         self._hover_romaji_text = None
         self._hover_word_idx = -1
         self._clear_hover_overlay()
@@ -850,10 +910,10 @@ class ScreenFreezerApp:
         screen_h = self.canvas.winfo_height()
 
         x = orig['x'] + (orig['width'] - w) // 2
-        y = orig['y'] + orig['height'] + 8
+        y = orig['y'] + orig['height'] + 24
 
         if y + h > screen_h:
-            y = orig['y'] - h - 8
+            y = orig['y'] - h - 24
             if y < 0:
                 y = (screen_h - h) // 2
                 x = (screen_w - w) // 2
@@ -862,7 +922,7 @@ class ScreenFreezerApp:
         y = max(0, min(y, screen_h - h))
 
         frame = tk.Frame(
-            self.canvas, bg="#ffffff", padx=8, pady=6,
+            self.canvas, bg="#ffffff", padx=5, pady=3,
             highlightbackground="#e5e5ea", highlightcolor="#e5e5ea",
             highlightthickness=1, bd=0
         )
@@ -870,32 +930,22 @@ class ScreenFreezerApp:
         if self.show_crop:
             crop_tk = ImageTk.PhotoImage(crop_pil)
             self.crop_tk_imgs.append(crop_tk)
-            tk.Label(frame, image=crop_tk, bg="#ffffff", bd=0).pack(anchor="w", pady=(0, 4))
+            tk.Label(frame, image=crop_tk, bg="#ffffff", bd=0).pack(anchor="w", pady=(0, 22))
 
         self._hover_original_text = tk.Text(
             frame, height=1, wrap="none", bd=0, highlightthickness=0,
             bg="#ffffff", fg="#a31515",
-            font=("Segoe UI", 11, "bold"),
+            font=(self.japanese_font, self.japanese_font_size, "bold"),
         )
         self._hover_original_text.insert("1.0", data['original'])
         self._hover_original_text.tag_config("hl", background="#ffcc00")
         self._hover_original_text.config(state="disabled")
-        self._hover_original_text.pack(fill="x", pady=(0, 2))
-
-        self._hover_kana_text = tk.Text(
-            frame, height=1, wrap="none", bd=0, highlightthickness=0,
-            bg="#ffffff", fg="#248a3d",
-            font=("Segoe UI", 10, "normal"),
-        )
-        self._hover_kana_text.insert("1.0", data['kana'])
-        self._hover_kana_text.tag_config("hl", background="#ffcc00")
-        self._hover_kana_text.config(state="disabled")
-        self._hover_kana_text.pack(fill="x", pady=(0, 2))
+        self._hover_original_text.pack(fill="x")
 
         self._hover_romaji_text = tk.Text(
             frame, height=1, wrap="none", bd=0, highlightthickness=0,
             bg="#ffffff", fg="#0066cc",
-            font=("Segoe UI", 9, "italic"),
+            font=("Segoe UI", max(7, self.font_size_en - 2), "italic"),
         )
         self._hover_romaji_text.insert("1.0", data['romaji'])
         self._hover_romaji_text.tag_config("hl", background="#ffcc00")
@@ -904,7 +954,7 @@ class ScreenFreezerApp:
             self._hover_romaji_text.pack(fill="x", pady=(0, 2))
 
         tk.Label(frame, text=data['english'], fg="#1c1c1e", bg="#ffffff",
-                 font=("Segoe UI", 11, "bold"), anchor="w", justify="left",
+                 font=("Segoe UI", self.font_size_en, "bold"), anchor="w", justify="left",
                  wraplength=w - 16
                  ).pack(fill="x")
 
@@ -977,9 +1027,10 @@ class ScreenFreezerApp:
         self._hover_overlay_items.append(item)
 
     def _clear_hover_tags(self):
-        for tw in (self._hover_original_text, self._hover_kana_text, self._hover_romaji_text):
-            if tw:
-                tw.tag_remove("hl", "1.0", "end")
+        if self._hover_original_text:
+            self._hover_original_text.tag_remove("hl", "1.0", "end")
+        if self._hover_romaji_text:
+            self._hover_romaji_text.tag_remove("hl", "1.0", "end")
 
     def update_hover_highlights(self, box, char_idx):
         """Highlight kana/romaji ranges that correspond to the hovered character."""
@@ -994,10 +1045,9 @@ class ScreenFreezerApp:
             if kr['char_start'] <= char_idx < kr['char_end']:
                 if self._hover_original_text:
                     self._hover_original_text.tag_add("hl", f"1.{kr['char_start']}", f"1.{kr['char_end']}")
-                if self._hover_kana_text:
-                    self._hover_kana_text.tag_add("hl", f"1.{kr['text_start']}", f"1.{kr['text_end']}")
                 if self._hover_romaji_text:
                     self._hover_romaji_text.tag_add("hl", f"1.{rr['text_start']}", f"1.{rr['text_end']}")
+                break
 
     # ── Word-level selection & clipboard ──────────────────────────────────────
 
