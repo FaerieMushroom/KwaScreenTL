@@ -210,7 +210,10 @@ def _build_alternatives(orig, sudachi_hira):
                     for r in g.on_readings:
                         _add(jaconv.kata2hira(str(r)), 'on')
                     for r in g.kun_readings:
-                        clean = jaconv.kata2hira(str(r)).split('.')[0].replace('-', '')
+                        raw = jaconv.kata2hira(str(r))
+                        if raw.startswith('-') or raw.endswith('-'):
+                            continue  # compound-only suffix/prefix reading
+                        clean = raw.split('.')[0].replace('-', '')
                         if clean:
                             _add(clean, 'kun')
                 if hasattr(ch, 'nanoris') and ch.nanoris:
@@ -219,14 +222,23 @@ def _build_alternatives(orig, sudachi_hira):
         except Exception:
             pass
 
-    # Context-based filter: compound (jukugo) → on'yomi, standalone → kun'yomi
+    # Context-based filter: keep relevant reading types
     # XXX: May need to revert this filtering if it causes too many missing readings
     kanji_count = sum(1 for c in orig if _is_kanji(c))
     default = alts[0]
     if kanji_count > 1:
-        alts = [a for a in alts if a['type'] in ('on', 'unknown')]
+        # Compound: only keep word-level readings (JMDict/Sudachi).
+        # Per-character on/kun/nanori don't form valid compound readings.
+        alts = [a for a in alts if a['type'] == 'unknown']
     elif kanji_count == 1:
-        alts = [a for a in alts if a['type'] in ('kun', 'nanori', 'unknown')]
+        # Standalone kanji: drop nanori and on for inflected verb forms
+        if orig and not _is_kanji(orig[-1]):
+            alts = [a for a in alts if a['type'] not in ('nanori', 'on')]
+            # Drop bare stem readings shorter than the full inflected form
+            # (e.g. ねが for 願え would lose the え in the romaji)
+            sudachi_len = len(sudachi_hira)
+            alts = [a for a in alts
+                    if a is alts[0] or len(a['hira']) >= sudachi_len]
     if default not in alts:
         alts.insert(0, default)
 
