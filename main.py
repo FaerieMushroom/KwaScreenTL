@@ -1143,12 +1143,9 @@ class ScreenFreezerApp:
         end = max(self._selection_start, self._selection_end)
         words = self.ocr_boxes[idx].get('words', [])
         if start == end:
-            # Single click → TTS whole line, clear any old highlight
+            # Single click → clear selection (no action)
             _, canvas, _ = self._box_windows[idx]
             canvas.delete("sel_hl")
-            text = self.ocr_boxes[idx]['data']['original']
-            if text:
-                threading.Thread(target=self.read_aloud, args=(text,), daemon=True).start()
             self._selection_box_idx = -1
             self._selection_start = -1
             self._selection_end = -1
@@ -1505,6 +1502,8 @@ class ScreenFreezerApp:
                 pass
 
     def read_aloud(self, text):
+        import asyncio, tempfile
+        import edge_tts
         tmp = tempfile.mktemp(suffix=".mp3")
         try:
             async def _save():
