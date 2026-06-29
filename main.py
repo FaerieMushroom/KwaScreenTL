@@ -46,6 +46,10 @@ CROP_BOTTOM = 10
 CROP_LEFT = 10
 CROP_RIGHT = 10
 
+# ── Box padding (px) — extra invisible area around OCR boxes for easier mouse aiming ─
+BOX_PAD = 2
+BORDER_WIDTH = 5
+
 FONT_CHOICES = ["Yu Gothic UI", "Yu Gothic", "Meiryo", "MS Gothic", "MS Mincho", "Segoe UI"]
 DEFAULT_FONT = "Yu Gothic UI"
 FONT_SIZES = [16, 18, 20, 22, 24, 26, 28, 32]
@@ -358,7 +362,7 @@ class ScreenFreezerApp:
         self.active = False
         self.pil_img = None
         self.ocr_boxes = []
-        self._box_windows = []          # list of (Toplevel, Canvas) per OCR box
+        self._box_windows = []          # list of (Toplevel, Canvas, idx) per OCR box
         self._card_window = None        # Toplevel for hover card or None
         self._card_canvas = None        # Canvas inside card window
         self.overlay_x = 0              # screen-X of captured game window
@@ -974,31 +978,33 @@ class ScreenFreezerApp:
 
         for idx, box in enumerate(boxes):
             bbox = box['orig_bbox']
-            bx = int(self.overlay_x + bbox['x'])
-            by = int(self.overlay_y + bbox['y'])
+            bx = int(self.overlay_x + bbox['x']) - BOX_PAD
+            by = int(self.overlay_y + bbox['y']) - BOX_PAD
             bw = max(int(bbox['width']), 4)
             bh = max(int(bbox['height']), 4)
+            win_w = bw + BOX_PAD * 2
+            win_h = bh + BOX_PAD * 2
 
             win = tk.Toplevel(self.root)
             win.overrideredirect(True)
-            win.geometry(f"{bw}x{bh}+{bx}+{by}")
+            win.geometry(f"{win_w}x{win_h}+{bx}+{by}")
             win.attributes("-topmost", True)
 
-            canvas = tk.Canvas(win, width=bw, height=bh,
+            canvas = tk.Canvas(win, width=win_w, height=win_h,
                                borderwidth=0, highlightthickness=0, bg="black")
             canvas.pack()
 
-            # Cropped OCR image scaled to fit box window
+            # Cropped OCR image scaled to fit original box size, offset by BOX_PAD
             crop = box.get('crop_pil')
             if crop:
                 crop_resized = crop.resize((bw, bh), Image.LANCZOS)
                 crop_tk = ImageTk.PhotoImage(crop_resized)
                 self.crop_tk_imgs.append(crop_tk)
-                canvas.create_image(0, 0, image=crop_tk, anchor="nw")
+                canvas.create_image(BOX_PAD, BOX_PAD, image=crop_tk, anchor="nw")
 
-            # Blue bounding border
-            canvas.create_rectangle(0, 0, bw - 1, bh - 1,
-                                    outline="#007aff", width=2, tags="box_border")
+            # Blue bounding border at full window size (padding included)
+            canvas.create_rectangle(0, 0, win_w - 1, win_h - 1,
+                                    outline="#007aff", width=BORDER_WIDTH, tags="box_border")
 
             # Translucency via WS_EX_LAYERED + LWA_ALPHA
             try:
@@ -1042,12 +1048,13 @@ class ScreenFreezerApp:
         if self.current_hover_idx != idx:
             self._hide_card()
             self.current_hover_idx = idx
-        # Highlight this box
-        for _, c, i in self._box_windows:
+        # Highlight this box, reset others
+        for win, canvas, i in self._box_windows:
             color = "#ff9500" if i == idx else "#007aff"
-            width = 3 if i == idx else 2
+            w = BORDER_WIDTH
             try:
-                c.itemconfig("box_border", outline=color, width=width)
+                canvas.itemconfig("box_border", outline=color, width=w)
+                canvas.delete("word_hl")
             except Exception:
                 pass
         self._show_card(idx)
@@ -1058,10 +1065,10 @@ class ScreenFreezerApp:
             return
         if self.current_hover_idx == idx:
             self._hide_card()
-        for _, c, i in self._box_windows:
+        for win, canvas, i in self._box_windows:
             try:
-                c.itemconfig("box_border", outline="#007aff", width=2)
-                c.delete("word_hl")
+                canvas.itemconfig("box_border", outline="#007aff", width=BORDER_WIDTH)
+                canvas.delete("word_hl")
             except Exception:
                 pass
 
@@ -1069,9 +1076,9 @@ class ScreenFreezerApp:
         """Mouse down on a box → start word selection."""
         if idx < 0 or idx >= len(self.ocr_boxes):
             return
-        # Clear previous selection highlight
-        _, old_canvas, _ = self._box_windows[idx]
-        old_canvas.delete("sel_hl")
+        # Clear previous selection highlight (inner canvas)
+        win, canvas = self._box_windows[idx][:2]
+        canvas.delete("sel_hl")
         self._selection_box_idx = -1
         self._selection_start = -1
         self._selection_end = -1
@@ -1080,8 +1087,8 @@ class ScreenFreezerApp:
         words = box.get('words', [])
         if not words:
             return
-        ox = bbox['x'] + event.x
-        oy = bbox['y'] + event.y
+        ox = bbox['x'] - BOX_PAD + event.x
+        oy = bbox['y'] - BOX_PAD + event.y
         wi = -1
         for i, w in enumerate(words):
             if w['x'] <= ox <= w['x'] + w['width'] and \
@@ -1106,8 +1113,8 @@ class ScreenFreezerApp:
         words = box.get('words', [])
         if not words:
             return
-        ox = bbox['x'] + event.x
-        oy = bbox['y'] + event.y
+        ox = bbox['x'] - BOX_PAD + event.x
+        oy = bbox['y'] - BOX_PAD + event.y
         wi = -1
         for i, w in enumerate(words):
             if w['x'] <= ox <= w['x'] + w['width'] and \
@@ -1117,8 +1124,8 @@ class ScreenFreezerApp:
         if wi < 0 or wi == self._selection_end:
             return
         self._selection_end = wi
-        # Redraw selection highlight
-        _, canvas, _ = self._box_windows[idx]
+        # Redraw selection highlight on inner canvas
+        win, canvas = self._box_windows[idx][:2]
         canvas.delete("sel_hl")
         bbox = self.ocr_boxes[idx]['orig_bbox']
         start = min(self._selection_start, self._selection_end)
@@ -1129,8 +1136,8 @@ class ScreenFreezerApp:
                 lx = w['x'] - bbox['x']
                 ly = w['y'] - bbox['y']
                 canvas.create_rectangle(lx, ly, lx + w['width'], ly + w['height'],
-                                        fill="#007aff", stipple="gray50", outline="",
-                                        tags="sel_hl")
+                                    fill="#007aff", stipple="gray50", outline="",
+                                    tags="sel_hl")
 
     def _box_release(self, event, idx):
         """Mouse release on a box → finalize selection."""
@@ -1144,8 +1151,8 @@ class ScreenFreezerApp:
         words = self.ocr_boxes[idx].get('words', [])
         if start == end:
             # Single click → clear selection (no action)
-            _, canvas, _ = self._box_windows[idx]
-            canvas.delete("sel_hl")
+            win2, canvas2 = self._box_windows[idx][:2]
+            canvas2.delete("sel_hl")
             self._selection_box_idx = -1
             self._selection_start = -1
             self._selection_end = -1
@@ -1436,8 +1443,8 @@ class ScreenFreezerApp:
         words = box.get('words', [])
         if not words or not self._card_window:
             return
-        ox = bbox['x'] + event.x
-        oy = bbox['y'] + event.y
+        ox = bbox['x'] - BOX_PAD + event.x
+        oy = bbox['y'] - BOX_PAD + event.y
         wi = -1
         for i, w in enumerate(words):
             if w['x'] <= ox <= w['x'] + w['width'] and \
@@ -1450,8 +1457,8 @@ class ScreenFreezerApp:
         # Convert word index → character offset for kakasi_items mapping
         char_off = sum(len(words[j]['text']) for j in range(wi))
 
-        _, canvas, _ = self._box_windows[idx]
-        canvas.delete("word_hl")
+        win2, canvas2 = self._box_windows[idx][:2]
+        canvas2.delete("word_hl")
 
         # Highlight all OCR words that fall within the same kakasi_items chunk
         ki = box['data'].get('kakasi_items', [])
@@ -1473,7 +1480,7 @@ class ScreenFreezerApp:
                     if wcoff < chunk_ce and wcoff + wlen > chunk_cs:
                         lx = w['x'] - bbox['x']
                         ly = w['y'] - bbox['y']
-                        canvas.create_rectangle(
+                        canvas2.create_rectangle(
                             lx, ly, lx + w['width'], ly + w['height'],
                             fill="#ffe082", stipple="gray25", outline="",
                             tags="word_hl")
@@ -1534,10 +1541,10 @@ class ScreenFreezerApp:
         self._selection_box_idx = -1
         self._selection_start = -1
         self._selection_end = -1
-        for _, c, _ in self._box_windows:
+        for win2, canvas2 in (e[:2] for e in self._box_windows):
             try:
-                c.delete("word_hl")
-                c.delete("sel_hl")
+                canvas2.delete("word_hl")
+                canvas2.delete("sel_hl")
             except Exception:
                 pass
 
