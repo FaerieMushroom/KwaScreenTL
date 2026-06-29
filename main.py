@@ -1215,13 +1215,36 @@ class ScreenFreezerApp:
         bbox = box['orig_bbox']
         card_w = box['w']
 
+        # Expand card width to fit Japanese text if needed
+        kf = tkfont.Font(family=self.japanese_font, size=self.japanese_font_size, weight="bold")
+        orig_w = kf.measure(data['original'])
+        if orig_w + 12 > card_w:
+            card_w = orig_w + 12
+        # Also measure romaji
+        if self.show_romaji and data.get('romaji'):
+            rf = tkfont.Font(family="Segoe UI", size=max(7, self.font_size_en - 2), slant="italic")
+            rom_w = rf.measure(data['romaji']) + 12
+            if rom_w > card_w:
+                card_w = rom_w
+
         # Card position: centered above the bounding box
         screen_x = int(self.overlay_x + bbox['x'] + (bbox['width'] - card_w) // 2)
         screen_y = int(self.overlay_y + bbox['y'])
         screen_x = max(0, screen_x)
+        # Clamp card width so it doesn't extend off-screen
+        screen_limit = 1920  # rough fallback
+        try:
+            screen_limit = self.root.winfo_screenwidth()
+        except Exception:
+            pass
+        max_card_w = screen_limit - screen_x - 8
+        if card_w > max_card_w:
+            card_w = max(max_card_w, 180)
+            screen_x = max(0, screen_x)
+        if screen_x + card_w > screen_limit:
+            screen_x = screen_limit - card_w - 8
 
         # Estimate card height (+ padding)
-        kf = tkfont.Font(family=self.japanese_font, size=self.japanese_font_size, weight="bold")
         en_font = tkfont.Font(family="Segoe UI", size=self.font_size_en, weight="bold")
         top_pad = 8
         content_h = top_pad
