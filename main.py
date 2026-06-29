@@ -124,6 +124,7 @@ WS_EX_TRANSPARENT = 0x20
 WS_EX_NOACTIVATE = 0x08000000
 GWL_EXSTYLE = -20
 LWA_COLORKEY = 0x1
+LWA_ALPHA = 0x2
 RGN_OR = 2
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
@@ -904,7 +905,7 @@ class ScreenFreezerApp:
                 text = re.sub(r'\s+', '', text)
                 if not text:
                     continue
-                if SKIP_NON_JAPANESE and not contains_japanese(text):
+                if self.skip_non_japanese and not contains_japanese(text):
                     print(f"[OCR SKIP] '{text}' (no Japanese chars)")
                     continue
                 translation_targets.append((text, bbox, crop_pil, words_data))
@@ -1049,7 +1050,7 @@ class ScreenFreezerApp:
             self._hide_card()
             self.current_hover_idx = idx
         # Highlight this box, reset others
-        for win, canvas, i in self._box_windows:
+        for _, canvas, i in self._box_windows:
             color = "#ff9500" if i == idx else "#007aff"
             w = BORDER_WIDTH
             try:
@@ -1065,7 +1066,7 @@ class ScreenFreezerApp:
             return
         if self.current_hover_idx == idx:
             self._hide_card()
-        for win, canvas, i in self._box_windows:
+        for _, canvas, _ in self._box_windows:
             try:
                 canvas.itemconfig("box_border", outline="#007aff", width=BORDER_WIDTH)
                 canvas.delete("word_hl")
@@ -1077,7 +1078,7 @@ class ScreenFreezerApp:
         if idx < 0 or idx >= len(self.ocr_boxes):
             return
         # Clear previous selection highlight (inner canvas)
-        win, canvas = self._box_windows[idx][:2]
+        _, canvas = self._box_windows[idx][:2]
         canvas.delete("sel_hl")
         self._selection_box_idx = -1
         self._selection_start = -1
@@ -1125,7 +1126,7 @@ class ScreenFreezerApp:
             return
         self._selection_end = wi
         # Redraw selection highlight on inner canvas
-        win, canvas = self._box_windows[idx][:2]
+        _, canvas = self._box_windows[idx][:2]
         canvas.delete("sel_hl")
         bbox = self.ocr_boxes[idx]['orig_bbox']
         start = min(self._selection_start, self._selection_end)
@@ -1139,7 +1140,7 @@ class ScreenFreezerApp:
                                     fill="#007aff", stipple="gray50", outline="",
                                     tags="sel_hl")
 
-    def _box_release(self, event, idx):
+    def _box_release(self, _event, idx):
         """Mouse release on a box → finalize selection."""
         if not self.is_dragging or self._selection_box_idx != idx:
             return
@@ -1151,7 +1152,7 @@ class ScreenFreezerApp:
         words = self.ocr_boxes[idx].get('words', [])
         if start == end:
             # Single click → clear selection (no action)
-            win2, canvas2 = self._box_windows[idx][:2]
+            _, canvas2 = self._box_windows[idx][:2]
             canvas2.delete("sel_hl")
             self._selection_box_idx = -1
             self._selection_start = -1
@@ -1199,23 +1200,21 @@ class ScreenFreezerApp:
             return text.strip()
         return None
 
-    def _box_right_click(self, event, idx):
+    def _box_right_click(self, _event, idx):
         """Right-click on a box → open in Jisho."""
         text = self._get_action_text(idx)
         if text:
-            import webbrowser, urllib.parse
             url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
             webbrowser.open(url)
 
-    def _box_shift_right_click(self, event, idx):
+    def _box_shift_right_click(self, _event, idx):
         """Shift+Right-click on a box → open in DeepL."""
         text = self._get_action_text(idx)
         if text:
-            import webbrowser, urllib.parse
             url = f"https://www.deepl.com/en/translator#ja/en/{urllib.parse.quote(text)}"
             webbrowser.open(url)
 
-    def _box_middle_click(self, event, idx):
+    def _box_middle_click(self, _event, idx):
         """Middle-click on a box → TTS."""
         text = self._get_action_text(idx)
         if text:
@@ -1457,7 +1456,7 @@ class ScreenFreezerApp:
         # Convert word index → character offset for kakasi_items mapping
         char_off = sum(len(words[j]['text']) for j in range(wi))
 
-        win2, canvas2 = self._box_windows[idx][:2]
+        _, canvas2 = self._box_windows[idx][:2]
         canvas2.delete("word_hl")
 
         # Highlight all OCR words that fall within the same kakasi_items chunk
@@ -1490,11 +1489,11 @@ class ScreenFreezerApp:
             self._card_hover_char_idx = char_off
             self._render_card()
 
-    def _card_leave(self, event):
+    def _card_leave(self, _event):
         """Handle mouse leave from card canvas — hide card."""
         self._hide_card()
 
-    def _box_mousewheel(self, event, idx):
+    def _box_mousewheel(self, event, _idx):
         """Mousewheel over a box → cycle reading for the hovered token."""
         if self._card_hover_char_idx < 0:
             return
@@ -1541,7 +1540,7 @@ class ScreenFreezerApp:
         self._selection_box_idx = -1
         self._selection_start = -1
         self._selection_end = -1
-        for win2, canvas2 in (e[:2] for e in self._box_windows):
+        for _, canvas2 in (e[:2] for e in self._box_windows):
             try:
                 canvas2.delete("word_hl")
                 canvas2.delete("sel_hl")
