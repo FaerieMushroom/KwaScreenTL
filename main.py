@@ -1300,6 +1300,21 @@ class ScreenFreezerApp:
         pos_font = ("Segoe UI", 8, "italic")
         kanji_info_font = ("Segoe UI", 9)
 
+        tf = tkfont.Font(font=title_font)
+        bf = tkfont.Font(font=body_font)
+        pf = tkfont.Font(font=pos_font)
+        kf = tkfont.Font(font=kanji_info_font)
+        title_h = tf.metrics("linespace")
+        body_h = bf.metrics("linespace")
+        pos_h = pf.metrics("linespace")
+        kanji_h = kf.metrics("linespace")
+
+        def _nlines(font_obj, text, wrap_width):
+            if not text:
+                return 0
+            tw = font_obj.measure(text)
+            return max(1, -(-tw // wrap_width))
+
         pad_x = 8
         ly = 6
         wrap_w = max(card_w - 16, 180)
@@ -1320,8 +1335,7 @@ class ScreenFreezerApp:
                     header += ", ".join(kana_texts)
 
             canvas.create_text(pad_x, ly, text=header, font=title_font, fill="#0066cc", anchor="nw", width=wrap_w)
-            est_header_lines = max(1, len(header) * 8 // wrap_w)
-            ly += est_header_lines * 18 + 4
+            ly += _nlines(tf, header, wrap_w) * title_h + 4
 
             for si, sense in enumerate(entry.senses[:3]):
                 glosses = ", ".join(g.text for g in sense.gloss)
@@ -1329,13 +1343,11 @@ class ScreenFreezerApp:
 
                 if pos:
                     canvas.create_text(pad_x + 6, ly, text=pos, font=pos_font, fill="#8e8e93", anchor="nw", width=wrap_w_inner)
-                    est_pos_lines = max(1, len(pos) * 6 // wrap_w_inner)
-                    ly += est_pos_lines * 14 + 2
+                    ly += _nlines(pf, pos, wrap_w_inner) * pos_h + 2
 
                 def_text = f"{si + 1}. {glosses}"
                 canvas.create_text(pad_x + 6, ly, text=def_text, font=body_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
-                est_def_lines = max(1, len(def_text) * 7 // wrap_w_inner)
-                ly += est_def_lines * 16 + 4
+                ly += _nlines(bf, def_text, wrap_w_inner) * body_h + 4
 
         kanji_chars = [c for c in word if _is_kanji(c)]
         if kanji_chars:
@@ -1407,10 +1419,11 @@ class ScreenFreezerApp:
                 ly += 16
                 for kil in kanji_info_lines:
                     canvas.create_text(pad_x + 6, ly, text=kil, font=kanji_info_font, fill="#3a3a3c", anchor="nw", width=wrap_w_inner)
-                    est_kil_lines = max(1, len(kil) * 7 // wrap_w_inner)
-                    ly += est_kil_lines * 15 + 2
+                    ly += _nlines(kf, kil, wrap_w_inner) * kanji_h + 2
 
-        dict_h = ly + 8
+        canvas.update_idletasks()
+        bbox = canvas.bbox("all")
+        dict_h = (bbox[3] if bbox else ly) + 8
         dict_x = self.overlay_x
         dict_y = self.overlay_y + self.overlay_h + 4
 
