@@ -114,6 +114,17 @@ def translate_deepl(text):
     resp.raise_for_status()
     return resp.json()["translations"][0]["text"]
 
+# Win32 constants for click-through overlay
+WS_EX_LAYERED = 0x80000
+WS_EX_TRANSPARENT = 0x20
+WS_EX_NOACTIVATE = 0x08000000
+GWL_EXSTYLE = -20
+LWA_COLORKEY = 0x1
+RGN_OR = 2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
 # Win32 structures for mouse cursor position
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -342,17 +353,32 @@ def get_line_bounding_rect(line):
 class ScreenFreezerApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.withdraw()  # Hide root window
+        self.root.withdraw()
         self.msg_queue = queue.Queue()
-        self.active_window = None
-        self.previous_hwnd = None
+        self.active = False
         self.pil_img = None
-        self.tk_img = None
-        self.overlay_hwnd = None
-        self.overlay_visible = True
-        self.is_dragging = False
-        self.current_hover_idx = -1
         self.ocr_boxes = []
+        self._box_windows = []          # list of (Toplevel, Canvas) per OCR box
+        self._card_window = None        # Toplevel for hover card or None
+        self._card_canvas = None        # Canvas inside card window
+        self.overlay_x = 0              # screen-X of captured game window
+        self.overlay_y = 0              # screen-Y of captured game window
+        self.overlay_w = 0
+        self.overlay_h = 0
+        self.current_hover_idx = -1
+        self.is_dragging = False
+        self._card_data = None
+        self._card_data_idx = -1
+        self._card_box = None
+        self._card_token_positions = []
+        self._card_romaji_positions = []
+        self._card_hover_char_idx = -1
+        self._prev_focus_hwnd = None
+        self._loading_win = None
+        self._overlay_hidden = False
+        self._selection_box_idx = -1
+        self._selection_start = -1
+        self._selection_end = -1
         self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
         self.japanese_font = DEFAULT_FONT
         self.japanese_font_size = DEFAULT_FONT_SIZE
@@ -362,7 +388,6 @@ class ScreenFreezerApp:
         
         # Start checking the queue for trigger events or translation results
         self.root.after(100, self.check_queue)
-        self.root.after(500, self.check_focus)
 
     def _load_settings(self):
         defaults = {"show_crop": True, "show_romaji": True, "skip_non_japanese": SKIP_NON_JAPANESE}
@@ -395,7 +420,10 @@ class ScreenFreezerApp:
             while True:
                 msg_type, data = self.msg_queue.get_nowait()
                 if msg_type == "trigger":
-                    self.freeze_screen()
+                    if self.active:
+                        self.unfreeze_screen()
+                    else:
+                        self.freeze_screen()
                 elif msg_type == "trigger_snip":
                     self.enter_snip_mode()
                 elif msg_type == "ocr_complete":
@@ -515,55 +543,26 @@ class ScreenFreezerApp:
         ))
 
     def _refresh_hover_card(self):
+        self._hide_card()
         if self.current_hover_idx >= 0 and self.current_hover_idx < len(self.ocr_boxes):
-            self.clear_hover_translation()
-            self.show_hover_translation(self.ocr_boxes[self.current_hover_idx])
-
-    def check_focus(self):
-        if not self.active_window:
-            self.root.after(500, self.check_focus)
-            return
-
-        # Don't hide while user is actively selecting text
-        if self.is_dragging:
-            self.root.after(500, self.check_focus)
-            return
-
-        fg = user32.GetForegroundWindow()
-        # Hide overlay when neither the game nor the overlay is focused
-        if self.overlay_visible and fg not in (self.overlay_hwnd, self.previous_hwnd):
-            self.overlay_visible = False
-            self.active_window.withdraw()
-        # Re-show when the game (or overlay) becomes active again
-        elif not self.overlay_visible and fg in (self.overlay_hwnd, self.previous_hwnd):
-            self.active_window.deiconify()
-            self.active_window.attributes("-topmost", True)
-            self.overlay_visible = True
-
-        self.root.after(500, self.check_focus)
+            self._show_card(self.current_hover_idx)
 
     def freeze_screen(self):
-        if self.active_window is not None:
-            return  # Already active
+        if self.active:
+            self.unfreeze_screen()
+            return
 
-        # 1. Capture currently active window handle + its screen bounds
-        self.previous_hwnd = ctypes.windll.user32.GetForegroundWindow()
-
-        # Get the focused window's bounding rect in screen coordinates
+        # Capture currently active window handle + its screen bounds
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        self._prev_focus_hwnd = fg_hwnd
         rect = ctypes.wintypes.RECT()
-        ctypes.windll.user32.GetWindowRect(self.previous_hwnd, ctypes.byref(rect))
-        win_rect = {
-            'left': rect.left,
-            'top': rect.top,
-            'right': rect.right,
-            'bottom': rect.bottom,
-        }
+        ctypes.windll.user32.GetWindowRect(fg_hwnd, ctypes.byref(rect))
+        win_rect = {'left': rect.left, 'top': rect.top, 'right': rect.right, 'bottom': rect.bottom}
 
-        # 2. Capture the full monitor screen where the mouse cursor is located
+        # Capture the full monitor where the mouse cursor is located
         sct_img, monitor = capture_moused_monitor()
         self.pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
-        # Convert window rect to monitor-local coordinates
         mx_off = monitor['left']
         my_off = monitor['top']
         win_local = {
@@ -572,62 +571,51 @@ class ScreenFreezerApp:
             'w': min(monitor['width'],  win_rect['right']  - mx_off) - max(0, win_rect['left'] - mx_off),
             'h': min(monitor['height'], win_rect['bottom'] - my_off) - max(0, win_rect['top']  - my_off),
         }
-
-        # Apply crop margins to trim window chrome / unwanted edges
         win_local['x'] += CROP_LEFT
         win_local['y'] += CROP_TOP
         win_local['w'] -= CROP_LEFT + CROP_RIGHT
         win_local['h'] -= CROP_TOP + CROP_BOTTOM
 
-        # 3. Create overlay window positioned over the game window (not full screen)
-        overlay_x = win_rect['left'] + CROP_LEFT
-        overlay_y = win_rect['top'] + CROP_TOP
-        overlay_w = win_local['w']
-        overlay_h = win_local['h']
+        # Store overlay position for box window placement
+        self.overlay_x = win_rect['left'] + CROP_LEFT
+        self.overlay_y = win_rect['top'] + CROP_TOP
+        self.overlay_w = win_local['w']
+        self.overlay_h = win_local['h']
+        self.active = True
 
-        self.active_window = tk.Toplevel(self.root)
-        self.active_window.overrideredirect(True)
-        self.active_window.geometry(f"{overlay_w}x{overlay_h}+{overlay_x}+{overlay_y}")
-
-        self.canvas = tk.Canvas(self.active_window, borderwidth=0, highlightthickness=0, bg="black")
-        self.canvas.pack(fill="both", expand=True)
-
-        # Capture overlay top-level HWND for focus tracking
-        self.active_window.update_idletasks()
-        self.overlay_hwnd = user32.GetAncestor(self.active_window.winfo_id(), 2)  # GA_ROOT
-        self.overlay_visible = True
-
-        # 4. Show only the cropped game window content as background
-        bg_crop = self.pil_img.crop((win_local['x'], win_local['y'],
+        # Loading overlay: captured game region + blue border + status text
+        win_crop = self.pil_img.crop((win_local['x'], win_local['y'],
                                       win_local['x'] + win_local['w'],
                                       win_local['y'] + win_local['h']))
-        self.tk_img = ImageTk.PhotoImage(bg_crop)
-        self.canvas.create_image(0, 0, image=self.tk_img, anchor="nw")
+        self._loading_win = tk.Toplevel(self.root)
+        self._loading_win.overrideredirect(True)
+        self._loading_win.geometry(f"{win_local['w']}x{win_local['h']}+{self.overlay_x}+{self.overlay_y}")
+        self._loading_win.attributes("-topmost", True)
+        lc = tk.Canvas(self._loading_win, width=win_local['w'], height=win_local['h'],
+                       borderwidth=0, highlightthickness=0)
+        lc.pack()
+        load_tk = ImageTk.PhotoImage(win_crop)
+        self._load_tk_img = load_tk
+        lc.create_image(0, 0, image=load_tk, anchor="nw")
+        lc.create_rectangle(0, 0, win_local['w'] - 1, win_local['h'] - 1,
+                            outline="#007aff", width=2)
+        lc.create_rectangle(win_local['w'] // 2 - 160, 8,
+                            win_local['w'] // 2 + 160, 46,
+                            fill="#1c1c1e", outline="#3a3a3c", width=2)
+        load_text = lc.create_text(win_local['w'] // 2, 25,
+                                   text="[ Running OCR / Translation... ]",
+                                   fill="#ffffff", font=("Segoe UI", 14, "bold"))
+        lc.tag_raise(load_text)
+        try:
+            self._loading_win.update_idletasks()
+            hwnd = user32.GetAncestor(self._loading_win.winfo_id(), 2)
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+            user32.SetLayeredWindowAttributes(hwnd, 0, 0xDD, LWA_ALPHA)
+        except Exception:
+            pass
 
-        # Draw a subtle border to indicate the overlay is active
-        self.canvas.create_rectangle(0, 0, overlay_w - 1, overlay_h - 1,
-                                      outline="#007aff", width=2)
-
-        # Loader text
-        self.loader_text = self.canvas.create_text(
-            overlay_w // 2, 25,
-            text="[ Running OCR / Translation... ]",
-            fill="#ffffff", font=("Segoe UI", 14, "bold"), justify="center"
-        )
-        self.canvas.create_rectangle(
-            overlay_w // 2 - 160, 8, overlay_w // 2 + 160, 46,
-            fill="#1c1c1e", outline="#3a3a3c", width=2, tags="loader_bg"
-        )
-        self.canvas.tag_raise(self.loader_text)
-
-        # 5. Bind escape key to close
-        self.active_window.bind("<Escape>", lambda e: self.unfreeze_screen())
-
-        # 6. Bring overlay to front
-        self.active_window.attributes("-topmost", True)
-        self.active_window.focus_force()
-
-        # 7. Start background thread for OCR & Translation
+        # Start OCR & Translation in background
         threading.Thread(
             target=self.process_ocr,
             args=(self.pil_img, win_local),
@@ -637,7 +625,7 @@ class ScreenFreezerApp:
     # ── Snip mode (drag-select region, Ctrl+Alt+Shift+R) ────────────────────
 
     def enter_snip_mode(self):
-        if self.active_window:
+        if self.active:
             return
         sct_img, self.snip_monitor = capture_moused_monitor()
         self.pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
@@ -732,7 +720,28 @@ class ScreenFreezerApp:
         self.overlay_hwnd = user32.GetAncestor(self.active_window.winfo_id(), 2)
         self.overlay_visible = True
 
-        # Crop the full image to the selected region
+        # Show cropped region as background
+        mx_off = self.snip_monitor['left']
+        my_off = self.snip_monitor['top']
+        bg_crop = self.pil_img.crop((left - mx_off, top - my_off,
+                                      left - mx_off + w, top - my_off + h))
+        self.tk_img = ImageTk.PhotoImage(bg_crop)
+        self.canvas.create_image(0, 0, image=self.tk_img, anchor="nw")
+
+        # Blue border + loading indicator
+        self.canvas.create_rectangle(0, 0, w - 1, h - 1, outline="#007aff", width=2, tags="overlay_border")
+        self._loader_text = self.canvas.create_text(
+            w // 2, 25,
+            text="[ Running OCR / Translation... ]",
+            fill="#ffffff", font=("Segoe UI", 14, "bold"), justify="center"
+        )
+        self._loader_bg = self.canvas.create_rectangle(
+            w // 2 - 160, 8, w // 2 + 160, 46,
+            fill="#1c1c1e", outline="#3a3a3c", width=2
+        )
+        self.canvas.tag_raise(self._loader_text)
+
+        # Crop the full image to the selected region (for OCR processing)
         mx_off = self.snip_monitor['left']
         my_off = self.snip_monitor['top']
         win_local = {
@@ -742,25 +751,9 @@ class ScreenFreezerApp:
             'h': h,
         }
 
-        bg_crop = self.pil_img.crop((win_local['x'], win_local['y'],
-                                      win_local['x'] + w, win_local['y'] + h))
-        self.tk_img = ImageTk.PhotoImage(bg_crop)
-        self.canvas.create_image(0, 0, image=self.tk_img, anchor="nw")
-        self.canvas.create_rectangle(0, 0, w - 1, h - 1, outline="#007aff", width=2)
-
-        self.loader_text = self.canvas.create_text(
-            w // 2, 25,
-            text="[ Running OCR / Translation... ]",
-            fill="#ffffff", font=("Segoe UI", 14, "bold"), justify="center"
-        )
-        self.canvas.create_rectangle(
-            w // 2 - 160, 8, w // 2 + 160, 46,
-            fill="#1c1c1e", outline="#3a3a3c", width=2, tags="loader_bg"
-        )
-        self.canvas.tag_raise(self.loader_text)
         self.active_window.bind("<Escape>", lambda e: self.unfreeze_screen())
         self.active_window.attributes("-topmost", True)
-        self.active_window.focus_force()
+        self.active = True
 
         threading.Thread(
             target=self.process_ocr,
@@ -959,538 +952,526 @@ class ScreenFreezerApp:
             self.msg_queue.put(("ocr_complete", []))
 
     def display_translations(self, boxes):
-        """Store OCR results, draw highlights, and enable hover-to-show translation."""
-        if not self.active_window:
+        """Create per-box translucent overlay windows from OCR results."""
+        if not self.active:
             return
 
-        self.canvas.delete(self.loader_text)
-        self.canvas.delete("loader_bg")
+        # Destroy previous box windows
+        self._destroy_box_windows()
+
+        # Dismiss loading overlay
+        if self._loading_win:
+            try:
+                self._loading_win.destroy()
+            except Exception:
+                pass
+            self._loading_win = None
+            self._load_tk_img = None
 
         self.ocr_boxes = boxes
         self.current_hover_idx = -1
-        self.hover_window_id = None
-        self.highlight_refs = []
         self.crop_tk_imgs = []
-        self.is_dragging = False
-        self.selection_box_idx = -1
-        self.selection_start = -1
-        self.selection_end = -1
-        self.selection_overlays = []
-        self._hover_card_items = []
-        self._hover_card_hl_items = []
-        self._hover_card_bg_id = None
-        self._hover_chunk_positions = []
-        self._hover_hl_y = 0
-        self._hover_word_idx = -1
-        self._hover_kakasi_items = []
-        self._hover_fg_items = {}
-        self._hover_romaji_id = None
-        self._hover_overlay_items = []
 
-        for box in boxes:
-            orig = box['orig_bbox']
-            ref = self.canvas.create_rectangle(
-                orig['x'] - 2, orig['y'] - 2,
-                orig['x'] + orig['width'] + 2, orig['y'] + orig['height'] + 2,
-                outline="#007aff", width=2, tags="ocr_highlight"
-            )
-            self.highlight_refs.append(ref)
+        for idx, box in enumerate(boxes):
+            bbox = box['orig_bbox']
+            bx = int(self.overlay_x + bbox['x'])
+            by = int(self.overlay_y + bbox['y'])
+            bw = max(int(bbox['width']), 4)
+            bh = max(int(bbox['height']), 4)
 
-        self.canvas.bind("<Motion>", self.on_mouse_move)
-        self.canvas.bind("<Leave>", lambda e: self.clear_hover_translation())
-        self.canvas.bind("<Button-1>", self.on_mouse_down)
-        self.canvas.bind("<B1-Motion>", self.on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.on_release)
-        self.canvas.bind("<Button-3>", self.on_right_click)
-        self.canvas.bind("<Shift-Button-3>", self.on_shift_right_click)
-        self.canvas.bind("<Button-2>", self.on_middle_click)
-        self.canvas.bind("<MouseWheel>", self.on_furigana_scroll)
-        self.canvas.bind("<Button-4>", self.on_furigana_scroll)
-        self.canvas.bind("<Button-5>", self.on_furigana_scroll)
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.geometry(f"{bw}x{bh}+{bx}+{by}")
+            win.attributes("-topmost", True)
 
-    def on_mouse_move(self, event):
+            canvas = tk.Canvas(win, width=bw, height=bh,
+                               borderwidth=0, highlightthickness=0, bg="black")
+            canvas.pack()
+
+            # Cropped OCR image scaled to fit box window
+            crop = box.get('crop_pil')
+            if crop:
+                crop_resized = crop.resize((bw, bh), Image.LANCZOS)
+                crop_tk = ImageTk.PhotoImage(crop_resized)
+                self.crop_tk_imgs.append(crop_tk)
+                canvas.create_image(0, 0, image=crop_tk, anchor="nw")
+
+            # Blue bounding border
+            canvas.create_rectangle(0, 0, bw - 1, bh - 1,
+                                    outline="#007aff", width=2, tags="box_border")
+
+            # Translucency via WS_EX_LAYERED + LWA_ALPHA
+            try:
+                win.update_idletasks()
+                hwnd = user32.GetAncestor(win.winfo_id(), 2)
+                ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+                user32.SetLayeredWindowAttributes(hwnd, 0, 0xBB, LWA_ALPHA)
+            except Exception:
+                pass
+
+            # Mouse bindings
+            canvas.bind("<Enter>", lambda e, i=idx: self._box_enter(i))
+            canvas.bind("<Leave>", lambda e, i=idx: self._box_leave(i))
+            canvas.bind("<Motion>", lambda e, i=idx: self._box_motion(e, i))
+            canvas.bind("<MouseWheel>", lambda e, i=idx: self._box_mousewheel(e, i))
+            canvas.bind("<Button-1>", lambda e, i=idx: self._box_click(e, i))
+            canvas.bind("<B1-Motion>", lambda e, i=idx: self._box_drag(e, i))
+            canvas.bind("<ButtonRelease-1>", lambda e, i=idx: self._box_release(e, i))
+            canvas.bind("<Button-3>", lambda e, i=idx: self._box_right_click(e, i))
+
+            # Escape on the box window itself
+            win.bind("<Escape>", lambda e: self.unfreeze_screen())
+
+            self._box_windows.append((win, canvas, idx))
+
+    def _destroy_box_windows(self):
+        """Destroy all box windows and hide card."""
+        self._hide_card()
+        for win, _, _ in self._box_windows:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._box_windows = []
+
+    def _box_enter(self, idx):
+        """Mouse entered a box window → highlight it and show card."""
+        if self.current_hover_idx != idx:
+            self._hide_card()
+            self.current_hover_idx = idx
+        # Highlight this box
+        for _, c, i in self._box_windows:
+            color = "#ff9500" if i == idx else "#007aff"
+            width = 3 if i == idx else 2
+            try:
+                c.itemconfig("box_border", outline=color, width=width)
+            except Exception:
+                pass
+        self._show_card(idx)
+
+    def _box_leave(self, idx):
+        """Mouse left a box window → hide card and reset highlights."""
         if self.is_dragging:
             return
-        if not hasattr(self, 'ocr_boxes') or not self.ocr_boxes:
+        if self.current_hover_idx == idx:
+            self._hide_card()
+        for _, c, i in self._box_windows:
+            try:
+                c.itemconfig("box_border", outline="#007aff", width=2)
+                c.delete("word_hl")
+            except Exception:
+                pass
+
+    def _box_click(self, event, idx):
+        """Mouse down on a box → start word selection."""
+        if idx < 0 or idx >= len(self.ocr_boxes):
             return
-
-        hover_idx = -1
-        for i, box in enumerate(self.ocr_boxes):
-            ob = box['orig_bbox']
-            if ob['x'] <= event.x <= ob['x'] + ob['width'] and \
-               ob['y'] <= event.y <= ob['y'] + ob['height']:
-                hover_idx = i
-                break
-
-        if hover_idx != self.current_hover_idx:
-            self.clear_hover_translation()
-            self.current_hover_idx = hover_idx
-            if hover_idx >= 0:
-                self.show_hover_translation(self.ocr_boxes[hover_idx])
-        elif hover_idx >= 0:
-            wi = self.get_word_at_pos(hover_idx, event.x, event.y)
-            if wi >= 0 and wi != self._hover_word_idx:
-                self._hover_word_idx = wi
-                self.update_hover_highlights(self.ocr_boxes[hover_idx], wi)
-                self._show_hover_overlay_highlight(hover_idx, wi)
-
-    def clear_hover_translation(self):
-        for item_id in self._hover_card_items:
-            self.canvas.delete(item_id)
-        self._hover_card_items = []
-        self._hover_chunk_positions = []
-        self._hover_card_bg_id = None
-        self._clear_hover_tags()
-        for ref in self.highlight_refs:
-            self.canvas.itemconfig(ref, outline="#007aff", width=2)
-        self.current_hover_idx = -1
-        self._hover_kakasi_items = []
-        self._hover_fg_items = {}
-        self._hover_romaji_id = None
-        self._hover_word_idx = -1
-        self._clear_hover_overlay()
-
-    def show_hover_translation(self, box):
-        data = box['data']
-        crop_pil = box['crop_pil']
-        orig = box['orig_bbox']
-        w = box['w']
-
-        idx = self.ocr_boxes.index(box)
-        if 0 <= idx < len(self.highlight_refs):
-            self.canvas.itemconfig(self.highlight_refs[idx], outline="#ff9500", width=3)
-
-        screen_w = self.canvas.winfo_width()
-
-        x = orig['x'] + (orig['width'] - w) // 2
-        gap = 4
-        card_bottom = orig['y'] - gap
-
-        x = max(0, min(x, screen_w - w))
-
-        kf = tkfont.Font(family=self.japanese_font, size=self.japanese_font_size, weight="bold")
-        en_font = tkfont.Font(family="Segoe UI", size=self.font_size_en, weight="bold")
-        ki = data.get('kakasi_items', [])
-        full_text = ''.join(it['orig'] for it in ki)
-        pad_x = 6
-
-        # Expand card width to fit original Japanese text
-        orig_w = kf.measure(data['original'])
-        if orig_w + pad_x * 2 > w:
-            w = orig_w + pad_x * 2
-            x = orig['x'] + (orig['width'] - w) // 2
-            x = max(0, min(x, screen_w - w))
-
-        # Calculate card height based on visible content
-        furigana_size = max(8, self.japanese_font_size // 2 - 1)
-        ff_temp = tkfont.Font(family=self.japanese_font, size=furigana_size)
-        fg_ascent = ff_temp.metrics("ascent")
-        fg_line_h = ff_temp.metrics("linespace")
-        top_pad = max(8, 6)
-        if self.show_crop:
-            crop_tk = ImageTk.PhotoImage(crop_pil)
-            self.crop_tk_imgs.append(crop_tk)
-            ih = crop_tk.height()
-            content_h = 3 + ih + 24
-        else:
-            content_h = top_pad
-        line_h = max(30, kf.metrics("linespace"))
-        content_h += line_h + 2  # original text line + gap
-        content_h += fg_line_h + 2  # furigana + gap
-        if self.show_romaji:
-            content_h += 18 + 2  # romaji + gap
-        est_chars_per_line = max(1, (w - 16) // 7)
-        en_lines = max(1, -(-len(data['english']) // est_chars_per_line))
-        en_line_h = en_font.metrics("linespace")
-        en_height = en_lines * en_line_h
-        content_h += en_height  # english
-        content_h += 3  # bottom padding
-        card_h = content_h
-
-        # Card positioned above the OCR box, extending upward
-        card_h = content_h
-        card_top = max(0, card_bottom - card_h)
-        card_y = card_top
-
-        # Background card
-        self._hover_card_bg_id = self.canvas.create_rectangle(
-            x, card_top, x + w, card_bottom,
-            fill="#ffffff", outline="#e5e5ea", width=1
-        )
-        self._hover_card_items.append(self._hover_card_bg_id)
-
-        # Crop image
-        if self.show_crop:
-            self._hover_card_items.append(self.canvas.create_image(
-                x + 5, card_y + 3, image=crop_tk, anchor="nw"
-            ))
-            line_y = card_y + 3 + ih + 24
-        else:
-            line_y = card_y + top_pad
-
-        # Original text (bold Japanese)
-        self._hover_kakasi_items = ki
-        self._hover_chunk_positions = []
-        ascent = kf.metrics("ascent")
-        descent = kf.metrics("descent")
-        self._hover_hl_y = line_y
-        self._hover_card_items.append(self.canvas.create_text(
-            x + pad_x, line_y, text=data['original'],
-            font=(self.japanese_font, self.japanese_font_size, "bold"),
-            fill="#a31515", anchor="nw"
-        ))
-
-        # Furigana below original text
-        ff = (self.japanese_font, furigana_size)
-        fg_y = line_y + line_h - 2
-        char_off = 0
-        self._hover_fg_items = {}  # chunk_idx → canvas item id
-        self._hover_card_x = x
-        self._hover_pad_x = pad_x
-        self._hover_romaji_chunks = []  # per-chunk {x, w} for highlight rect
-        for item in ki:
-            orig = item.get('orig', '')
-            hira = item.get('hira') or orig
-            prefix_w = kf.measure(full_text[:char_off])
-            group_w = kf.measure(orig)
-            chunk_x = x + pad_x + prefix_w
-            cp = {
-                'x': chunk_x,
-                'w': group_w,
-                'char_start': char_off,
-                'char_end': char_off + len(orig),
-            }
-            self._hover_chunk_positions.append(cp)
-            if orig != hira and any(_is_kanji(c) for c in orig):
-                cx = x + pad_x + prefix_w + group_w / 2
-                fg_id = self.canvas.create_text(
-                    cx, fg_y, text=hira, font=ff, fill="#248a3d", anchor="n"
-                )
-                self._hover_card_items.append(fg_id)
-                self._hover_fg_items[char_off] = fg_id
-            char_off += len(orig)
-
-        # Romaji and English y positions
-        romaji_y = fg_y + fg_line_h + 2
-        eng_y = romaji_y + 18 if self.show_romaji else fg_y + fg_line_h + 2
-
-        # Romaji text (single text item + per-chunk position tracking for highlight)
-        self._hover_romaji_id = None
-        self._hover_romaji_y = romaji_y
-        if self.show_romaji:
-            self._hover_romaji_id = self.canvas.create_text(
-                x + pad_x, romaji_y, text=data['romaji'],
-                font=("Segoe UI", max(7, self.font_size_en - 2), "italic"),
-                fill="#0066cc", anchor="nw"
-            )
-            self._hover_card_items.append(self._hover_romaji_id)
-            # Compute per-chunk romaji x/w for highlight rect
-            rf = tkfont.Font(family="Segoe UI", size=max(7, self.font_size_en - 2), slant="italic")
-            rfx = x + pad_x
-            for item in ki:
-                rt = item.get('hepburn', '') or item.get('orig', '')
-                rw = rf.measure(rt)
-                self._hover_romaji_chunks.append({'x': rfx, 'w': rw})
-                rfx += rw + rf.measure(' ')
-
-        # Store furigana bounds for scroll hit detection
-        self._hover_fg_y = fg_y
-        self._hover_fg_ascent = fg_ascent
-        self._hover_fg_line_h = fg_line_h
-
-        # English text
-        self._hover_card_items.append(self.canvas.create_text(
-            x + pad_x, eng_y, text=data['english'],
-            font=("Segoe UI", self.font_size_en, "bold"),
-            fill="#1c1c1e", anchor="nw", width=w - 16
-        ))
-
-    def on_furigana_scroll(self, event):
-        """Cycle furigana reading for the highlighted (hovered) kanji chunk."""
-        if self.current_hover_idx < 0 or self._hover_word_idx < 0:
-            return
-        # Find chunk matching the currently highlighted word
-        box = self.ocr_boxes[self.current_hover_idx]
-        ki = box['data']['kakasi_items']
-        target = None
-        for cp in self._hover_chunk_positions:
-            if cp['char_start'] <= self._hover_word_idx < cp['char_end']:
-                # Find corresponding item in kakasi_items by char offset
-                off = 0
-                for it in ki:
-                    if off == cp['char_start']:
-                        target = it
-                        break
-                    off += len(it.get('orig',''))
-                break
-        if target is None:
-            return
-        alts = target.get('alternatives', [])
-        if len(alts) < 2:
-            return
-        # Determine direction
-        delta = event.delta if hasattr(event, 'delta') else (120 if event.num == 4 else -120)
-        step = 1 if delta > 0 else -1
-        new_idx = (target['active_idx'] + step) % len(alts)
-        target['active_idx'] = new_idx
-        target['hira'] = alts[new_idx]['hira']
-        target['hepburn'] = alts[new_idx]['hepburn']
-        # Update furigana canvas text
-        fg_id = self._hover_fg_items.get(cp['char_start'])
-        if fg_id is not None and target['hira'] != target['orig']:
-            self.canvas.itemconfig(fg_id, text=target['hira'])
-        # Update romaji
-        new_romaji = " ".join([i['hepburn'] for i in ki])
-        box['data']['romaji'] = new_romaji
-        if self._hover_romaji_id is not None:
-            self.canvas.itemconfig(self._hover_romaji_id, text=new_romaji)
-            # Recompute romaji chunk positions for accurate highlight
-            rf = tkfont.Font(family="Segoe UI", size=max(7, self.font_size_en - 2), slant="italic")
-            rfx = self._hover_card_x + self._hover_pad_x
-            self._hover_romaji_chunks = []
-            for it in ki:
-                rt = it.get('hepburn', '') or it.get('orig', '')
-                rw = rf.measure(rt)
-                self._hover_romaji_chunks.append({'x': rfx, 'w': rw})
-                rfx += rw + rf.measure(' ')
-            # Refresh highlight rects with new positions
-            self.update_hover_highlights(
-                self.ocr_boxes[self.current_hover_idx], self._hover_word_idx
-            )
-
-
-    def _build_item_ranges(self, items):
-        """Build char→kana and char→romaji index ranges from kakasi_items."""
-        kana_ranges = []
-        romaji_ranges = []
-        kana_off = 0
-        romaji_off = 0
-        char_off = 0
-        for idx, item in enumerate(items):
-            orig = item.get('orig', '')
-            orig_len = len(orig)
-            kana_t = item.get('hira') or orig
-            romaji_t = item.get('hepburn', '')
-            kana_ranges.append({
-                'char_start': char_off, 'char_end': char_off + orig_len,
-                'text_start': kana_off, 'text_end': kana_off + len(kana_t),
-            })
-            romaji_ranges.append({
-                'char_start': char_off, 'char_end': char_off + orig_len,
-                'text_start': romaji_off, 'text_end': romaji_off + len(romaji_t),
-            })
-            char_off += orig_len
-            kana_off += len(kana_t)
-            romaji_off += len(romaji_t)
-            if idx < len(items) - 1:
-                kana_off += 1
-                romaji_off += 1
-        return kana_ranges, romaji_ranges
-
-    def _clear_hover_overlay(self):
-        for item in self._hover_overlay_items:
-            self.canvas.delete(item)
-        self._hover_overlay_items = []
-
-    def _show_hover_overlay_highlight(self, box_idx, word_idx):
-        self._clear_hover_overlay()
-        box = self.ocr_boxes[box_idx]
-        items = box['data'].get('kakasi_items', [])
-        if not items:
-            return
-        kana_ranges, _ = self._build_item_ranges(items)
-        chunk_chars = None
-        for kr in kana_ranges:
-            if kr['char_start'] <= word_idx < kr['char_end']:
-                chunk_chars = (kr['char_start'], kr['char_end'])
-                break
-        if not chunk_chars:
-            return
+        # Clear previous selection highlight
+        _, old_canvas, _ = self._box_windows[idx]
+        old_canvas.delete("sel_hl")
+        self._selection_box_idx = -1
+        self._selection_start = -1
+        self._selection_end = -1
+        box = self.ocr_boxes[idx]
+        bbox = box['orig_bbox']
         words = box.get('words', [])
-        xs, ys = [], []
-        for wi in range(chunk_chars[0], chunk_chars[1]):
-            if wi < len(words):
-                w = words[wi]
-                xs.append(w['x'])
-                xs.append(w['x'] + w['width'])
-                ys.append(w['y'])
-                ys.append(w['y'] + w['height'])
-        if not xs:
+        if not words:
             return
-        x1, x2 = min(xs), max(xs)
-        y1, y2 = min(ys), max(ys)
-        item = self.canvas.create_rectangle(
-            x1, y1, x2, y2,
-            fill="#ffe082", stipple="gray25", outline=""
-        )
-        self._hover_overlay_items.append(item)
-
-    def _clear_hover_tags(self):
-        for item_id in self._hover_card_hl_items:
-            self.canvas.delete(item_id)
-        self._hover_card_hl_items = []
-
-    def update_hover_highlights(self, box, char_idx):
-        """Draw highlight rect in card for the hovered chunk."""
-        self._clear_hover_tags()
-        if char_idx < 0 or not hasattr(self, '_hover_hl_y'):
-            return
-        for i, cp in enumerate(self._hover_chunk_positions):
-            if cp['char_start'] <= char_idx < cp['char_end']:
-                hl = self.canvas.create_rectangle(
-                    cp['x'], self._hover_hl_y,
-                    cp['x'] + cp['w'], self._hover_hl_y + 28,
-                    fill="#ffe082", outline=""
-                )
-                self._hover_card_hl_items.append(hl)
-                if self._hover_card_bg_id is not None:
-                    self.canvas.lift(hl, self._hover_card_bg_id)
-                # Highlight matching romaji chunk
-                if self.show_romaji and i < len(self._hover_romaji_chunks):
-                    rc = self._hover_romaji_chunks[i]
-                    hl2 = self.canvas.create_rectangle(
-                        rc['x'], self._hover_romaji_y,
-                        rc['x'] + rc['w'], self._hover_romaji_y + 16,
-                        fill="#ffe082", outline=""
-                    )
-                    self._hover_card_hl_items.append(hl2)
-                    if self._hover_card_bg_id is not None:
-                        self.canvas.lift(hl2, self._hover_card_bg_id)
+        ox = bbox['x'] + event.x
+        oy = bbox['y'] + event.y
+        wi = -1
+        for i, w in enumerate(words):
+            if w['x'] <= ox <= w['x'] + w['width'] and \
+               w['y'] <= oy <= w['y'] + w['height']:
+                wi = i
                 break
+        if wi < 0:
+            return
+        self._selection_box_idx = idx
+        self._selection_start = wi
+        self._selection_end = wi
+        self.is_dragging = True
 
-    # ── Word-level selection & clipboard ──────────────────────────────────────
-
-    def get_word_at_pos(self, box_idx, x, y):
-        words = self.ocr_boxes[box_idx].get('words', [])
-        for wi, w in enumerate(words):
-            if w['x'] <= x <= w['x'] + w['width'] and \
-               w['y'] <= y <= w['y'] + w['height']:
-                return wi
-        # fallback: closest word by center distance
-        best, best_d = -1, float('inf')
-        for wi, w in enumerate(words):
-            cx = w['x'] + w['width'] / 2
-            cy = w['y'] + w['height'] / 2
-            d = (cx - x) ** 2 + (cy - y) ** 2
-            if d < best_d:
-                best_d = d
-                best = wi
-        return best
-
-    def clear_selection_visuals(self):
-        for item in self.selection_overlays:
-            self.canvas.delete(item)
-        self.selection_overlays = []
-
-    def on_mouse_down(self, event):
-        self.clear_selection_visuals()
-        self.selection_box_idx = -1
-        self.selection_start = -1
-        self.selection_end = -1
-
-        for bi, box in enumerate(self.ocr_boxes):
-            ob = box['orig_bbox']
-            if ob['x'] <= event.x <= ob['x'] + ob['width'] and \
-               ob['y'] <= event.y <= ob['y'] + ob['height']:
-                self.selection_box_idx = bi
-                wi = self.get_word_at_pos(bi, event.x, event.y)
-                if wi >= 0:
-                    self.selection_start = wi
-                    self.selection_end = wi
-                    self.draw_selection_highlight()
-                self.is_dragging = True
+    def _box_drag(self, event, idx):
+        """Drag on a box → extend word selection with visual highlight."""
+        if not self.is_dragging or self._selection_box_idx != idx:
+            return
+        if idx < 0 or idx >= len(self.ocr_boxes):
+            return
+        box = self.ocr_boxes[idx]
+        bbox = box['orig_bbox']
+        words = box.get('words', [])
+        if not words:
+            return
+        ox = bbox['x'] + event.x
+        oy = bbox['y'] + event.y
+        wi = -1
+        for i, w in enumerate(words):
+            if w['x'] <= ox <= w['x'] + w['width'] and \
+               w['y'] <= oy <= w['y'] + w['height']:
+                wi = i
                 break
-
-    def on_drag(self, event):
-        if self.selection_box_idx < 0:
+        if wi < 0 or wi == self._selection_end:
             return
-        box = self.ocr_boxes[self.selection_box_idx]
-        ob = box['orig_bbox']
-        if not (ob['x'] <= event.x <= ob['x'] + ob['width'] and
-                ob['y'] <= event.y <= ob['y'] + ob['height']):
-            return
-        wi = self.get_word_at_pos(self.selection_box_idx, event.x, event.y)
-        if wi >= 0 and wi != self.selection_end:
-            self.selection_end = wi
-            self.draw_selection_highlight()
+        self._selection_end = wi
+        # Redraw selection highlight
+        _, canvas, _ = self._box_windows[idx]
+        canvas.delete("sel_hl")
+        bbox = self.ocr_boxes[idx]['orig_bbox']
+        start = min(self._selection_start, self._selection_end)
+        end = max(self._selection_start, self._selection_end)
+        for wi2 in range(start, end + 1):
+            if wi2 < len(words):
+                w = words[wi2]
+                lx = w['x'] - bbox['x']
+                ly = w['y'] - bbox['y']
+                canvas.create_rectangle(lx, ly, lx + w['width'], ly + w['height'],
+                                        fill="#007aff", stipple="gray50", outline="",
+                                        tags="sel_hl")
 
-    def draw_selection_highlight(self):
-        self.clear_selection_visuals()
-        if self.selection_box_idx < 0 or self.selection_start < 0 or self.selection_end < 0:
-            return
-        start = min(self.selection_start, self.selection_end)
-        end = max(self.selection_start, self.selection_end)
-        words = self.ocr_boxes[self.selection_box_idx].get('words', [])
-        for wi in range(start, end + 1):
-            if wi < len(words):
-                w = words[wi]
-                item = self.canvas.create_rectangle(
-                    w['x'], w['y'], w['x'] + w['width'], w['y'] + w['height'],
-                    fill="#007aff", stipple="gray50", outline=""
-                )
-                self.selection_overlays.append(item)
-
-    def on_release(self, event):
-        if not self.is_dragging:
+    def _box_release(self, event, idx):
+        """Mouse release on a box → finalize selection."""
+        if not self.is_dragging or self._selection_box_idx != idx:
             return
         self.is_dragging = False
-        if self.selection_box_idx < 0 or self.selection_start < 0 or self.selection_end < 0:
+        if self._selection_start < 0 or self._selection_end < 0:
             return
-        start = min(self.selection_start, self.selection_end)
-        end = max(self.selection_start, self.selection_end)
-        words = self.ocr_boxes[self.selection_box_idx].get('words', [])
-
+        start = min(self._selection_start, self._selection_end)
+        end = max(self._selection_start, self._selection_end)
+        words = self.ocr_boxes[idx].get('words', [])
         if start == end:
-            # Click (no drag) → read the whole line aloud, no highlight
-            self.clear_selection_visuals()
-            box_text = self.ocr_boxes[self.selection_box_idx]['data']['original']
-            if box_text:
-                threading.Thread(target=self.read_aloud, args=(box_text,), daemon=True).start()
+            # Single click → TTS whole line, clear any old highlight
+            _, canvas, _ = self._box_windows[idx]
+            canvas.delete("sel_hl")
+            text = self.ocr_boxes[idx]['data']['original']
+            if text:
+                threading.Thread(target=self.read_aloud, args=(text,), daemon=True).start()
+            self._selection_box_idx = -1
+            self._selection_start = -1
+            self._selection_end = -1
         else:
-            # Drag → copy selected words to clipboard
+            # Drag → copy selected text to clipboard, keep highlight
             selected = ''.join(w['text'] for wi, w in enumerate(words) if start <= wi <= end)
             if selected:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(selected)
-                print(f"[clipboard] {selected}")
 
-    def get_current_text(self):
-        """Return selected text, or hovered text as fallback."""
-        if self.selection_box_idx >= 0 and self.selection_start >= 0 and self.selection_end >= 0:
-            start = min(self.selection_start, self.selection_end)
-            end = max(self.selection_start, self.selection_end)
-            words = self.ocr_boxes[self.selection_box_idx].get('words', [])
-            return ''.join(w['text'] for wi, w in enumerate(words) if start <= wi <= end)
-        if self.current_hover_idx >= 0:
-            return self.ocr_boxes[self.current_hover_idx]['data']['original']
-        return None
+    def _box_right_click(self, event, idx):
+        """Right-click on a box → open in Jisho."""
+        if 0 <= idx < len(self.ocr_boxes):
+            text = self.ocr_boxes[idx]['data']['original']
+            if text:
+                import webbrowser, urllib.parse
+                url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
+                webbrowser.open(url)
 
-    def on_right_click(self, event):
-        text = self.get_current_text()
-        if text:
-            url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
-            webbrowser.open(url)
+    def _show_card(self, idx):
+        """Display the translation card as a separate Toplevel near the hovered box."""
+        if idx < 0 or idx >= len(self.ocr_boxes):
+            return
+        self._card_data_idx = idx
+        self._card_data = self.ocr_boxes[idx]['data']
+        self._card_box = self.ocr_boxes[idx]
+        self._card_hover_char_idx = -1
 
-    def on_shift_right_click(self, event):
-        text = self.get_current_text()
-        if text:
-            url = f"https://www.deepl.com/en/translator#ja/en/{urllib.parse.quote(text)}"
-            webbrowser.open(url)
+        if self._card_window:
+            self._render_card()
+            return
 
-    def on_middle_click(self, event):
-        text = self.get_current_text()
-        if text:
-            threading.Thread(target=self.read_aloud, args=(text,), daemon=True).start()
+        box = self._card_box
+        data = self._card_data
+        bbox = box['orig_bbox']
+        card_w = box['w']
+
+        # Card position: centered above the bounding box
+        screen_x = int(self.overlay_x + bbox['x'] + (bbox['width'] - card_w) // 2)
+        screen_y = int(self.overlay_y + bbox['y'])
+        screen_x = max(0, screen_x)
+
+        # Estimate card height (+ padding)
+        kf = tkfont.Font(family=self.japanese_font, size=self.japanese_font_size, weight="bold")
+        en_font = tkfont.Font(family="Segoe UI", size=self.font_size_en, weight="bold")
+        top_pad = 8
+        content_h = top_pad
+        if self.show_crop and box.get('crop_pil'):
+            content_h += box['crop_pil'].height + 24
+        line_h = max(30, kf.metrics("linespace"))
+        content_h += line_h + 2  # Japanese text
+        furigana_size = max(8, self.japanese_font_size // 2 - 1)
+        ff_temp = tkfont.Font(family=self.japanese_font, size=furigana_size)
+        content_h += ff_temp.metrics("linespace") + 2  # furigana
+        if self.show_romaji:
+            content_h += 18 + 2
+        est_chars = max(1, (card_w - 16) // 7)
+        en_lines = max(1, -(-len(data['english']) // est_chars))
+        content_h += en_lines * en_font.metrics("linespace")
+        content_h += 6
+        card_h = content_h
+
+        # Place card above the box (or below if not enough room)
+        card_bottom = int(screen_y - 4)
+        card_top = max(0, card_bottom - card_h)
+        if card_top < 20:
+            card_top = int(screen_y + bbox['height'] + 4)
+            card_bottom = card_top + card_h
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.geometry(f"{card_w}x{card_h}+{screen_x}+{card_top}")
+        win.attributes("-topmost", True)
+        canvas = tk.Canvas(win, width=card_w, height=card_h,
+                           borderwidth=0, highlightthickness=0, bg="#ffffff")
+        canvas.pack()
+        win.bind("<Escape>", lambda e: self.unfreeze_screen())
+
+        canvas.bind("<Leave>", self._card_leave)
+
+        self._card_window = win
+        self._card_canvas = canvas
+        self._render_card()
+
+    def _render_card(self):
+        """Draw/refresh card content on the existing card canvas."""
+        canvas = self._card_canvas
+        canvas.delete("all")
+        data = self._card_data
+        box = self._card_box
+        card_w = int(canvas.cget('width'))
+
+        kf = tkfont.Font(family=self.japanese_font, size=self.japanese_font_size, weight="bold")
+        en_font = tkfont.Font(family="Segoe UI", size=self.font_size_en, weight="bold")
+        furigana_size = max(8, self.japanese_font_size // 2 - 1)
+        ff_temp = tkfont.Font(family=self.japanese_font, size=furigana_size)
+        ff = (self.japanese_font, furigana_size)
+        line_h = max(30, kf.metrics("linespace"))
+        fg_line_h = ff_temp.metrics("linespace")
+
+        pad_x = 6
+        ly = 0
+
+        # Background border (height updated after all content)
+        canvas.create_rectangle(1, 1, card_w - 2, 1,
+                                outline="#e5e5ea", width=1, tags="card_bg")
+
+        # Crop image
+        if self.show_crop and box.get('crop_pil'):
+            crop_tk = ImageTk.PhotoImage(box['crop_pil'])
+            self.crop_tk_imgs.append(crop_tk)
+            canvas.create_image(5, ly + 3, image=crop_tk, anchor="nw")
+            ly += 3 + box['crop_pil'].height + 24
+        else:
+            ly += 8
+
+        # Japanese text line
+        jp_y = ly
+        canvas.create_text(pad_x, jp_y, text=data['original'],
+                           font=(self.japanese_font, self.japanese_font_size, "bold"),
+                           fill="#a31515", anchor="nw", tags="jp_text")
+        jp_text_bottom = jp_y + line_h
+
+        # Token position tracking for hover highlight
+        ki = data.get('kakasi_items', [])
+        full_text = ''.join(it['orig'] for it in ki)
+        fg_y = jp_text_bottom
+        char_off = 0
+        self._card_token_positions = []
+        self._card_romaji_positions = []
+        rf = tkfont.Font(family="Segoe UI", size=max(7, self.font_size_en - 2), slant="italic") if self.show_romaji else None
+        rfx = pad_x
+        for item_idx, item in enumerate(ki):
+            orig = item.get('orig', '')
+            hira = item.get('hira') or orig
+            prefix_w = kf.measure(full_text[:char_off])
+            group_w = kf.measure(orig)
+            x_start = pad_x + prefix_w
+            x_end = pad_x + prefix_w + group_w
+            self._card_token_positions.append((x_start, x_end, item_idx))
+
+            # Track romaji positions with italic font for accurate highlight
+            if self.show_romaji and rf:
+                rt = item.get('hepburn', '') or orig
+                rw = rf.measure(rt)
+                self._card_romaji_positions.append((rfx, rw, item_idx))
+                rfx += rw + rf.measure(' ')
+
+            # Draw furigana for kanji tokens
+            if orig != hira and any(_is_kanji(c) for c in orig):
+                cx = pad_x + prefix_w + group_w / 2
+                canvas.create_text(cx, fg_y + 2, text=hira, font=ff,
+                                   fill="#248a3d", anchor="n", tags="furigana")
+            char_off += len(orig)
+        ly = fg_y + fg_line_h + 2
+
+        # Romaji
+        rom_y = ly
+        if self.show_romaji:
+            canvas.create_text(pad_x, rom_y, text=data['romaji'],
+                               font=("Segoe UI", max(7, self.font_size_en - 2), "italic"),
+                               fill="#0066cc", anchor="nw", tags="romaji_text")
+            ly += 18 + 2
+
+        # English
+        eng_y = ly
+        canvas.create_text(pad_x, eng_y, text=data['english'],
+                           font=("Segoe UI", self.font_size_en, "bold"),
+                           fill="#1c1c1e", anchor="nw", width=card_w - 16, tags="eng_text")
+
+        # Update border to match content height
+        est_chars = max(1, (card_w - 16) // 7)
+        en_lines = max(1, -(-len(data['english']) // est_chars))
+        card_h = eng_y + en_lines * en_font.metrics("linespace") + 6
+        canvas.coords("card_bg", 1, 0, card_w - 1, card_h)
+        canvas.configure(height=card_h)
+
+        # Map hovered OCR character index → kakasi_items chunk index
+        hover_chunk_idx = -1
+        if self._card_hover_char_idx >= 0:
+            coff = 0
+            for ci, item in enumerate(ki):
+                orig = item.get('orig', '')
+                if coff <= self._card_hover_char_idx < coff + len(orig):
+                    hover_chunk_idx = ci
+                    break
+                coff += len(orig)
+
+        # Draw highlight for hovered word, then raise text above it
+        if hover_chunk_idx >= 0:
+            for x1, x2, idx in self._card_token_positions:
+                if idx == hover_chunk_idx:
+                    canvas.create_rectangle(
+                        x1 - 1, jp_y + 1, x2 + 1, jp_text_bottom - 1,
+                        fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
+                    )
+                    if self.show_romaji:
+                        for rx, rw, ri in self._card_romaji_positions:
+                            if ri == hover_chunk_idx:
+                                canvas.create_rectangle(
+                                    rx - 1, rom_y + 1, rx + rw + 1, rom_y + 17,
+                                    fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
+                        )
+                    break
+            canvas.tag_raise("jp_text")
+            canvas.tag_raise("furigana")
+            canvas.tag_raise("romaji_text")
+            canvas.tag_raise("eng_text")
+
+    def _box_motion(self, event, idx):
+        """Mouse moved over a box canvas → find OCR word under cursor, highlight on card."""
+        if idx < 0 or idx >= len(self.ocr_boxes):
+            return
+        box = self.ocr_boxes[idx]
+        bbox = box['orig_bbox']
+        words = box.get('words', [])
+        if not words or not self._card_window:
+            return
+        ox = bbox['x'] + event.x
+        oy = bbox['y'] + event.y
+        wi = -1
+        for i, w in enumerate(words):
+            if w['x'] <= ox <= w['x'] + w['width'] and \
+               w['y'] <= oy <= w['y'] + w['height']:
+                wi = i
+                break
+        if wi < 0:
+            return
+
+        # Convert word index → character offset for kakasi_items mapping
+        char_off = sum(len(words[j]['text']) for j in range(wi))
+
+        _, canvas, _ = self._box_windows[idx]
+        canvas.delete("word_hl")
+
+        # Highlight all OCR words that fall within the same kakasi_items chunk
+        ki = box['data'].get('kakasi_items', [])
+        if ki:
+            ci_off = 0
+            chunk_cs = -1
+            chunk_ce = -1
+            for item in ki:
+                orig_len = len(item.get('orig', ''))
+                if ci_off <= char_off < ci_off + orig_len:
+                    chunk_cs = ci_off
+                    chunk_ce = ci_off + orig_len
+                    break
+                ci_off += orig_len
+            if chunk_cs >= 0:
+                wcoff = 0
+                for w in words:
+                    wlen = len(w['text'])
+                    if wcoff < chunk_ce and wcoff + wlen > chunk_cs:
+                        lx = w['x'] - bbox['x']
+                        ly = w['y'] - bbox['y']
+                        canvas.create_rectangle(
+                            lx, ly, lx + w['width'], ly + w['height'],
+                            fill="#ffe082", stipple="gray25", outline="",
+                            tags="word_hl")
+                    wcoff += wlen
+
+        if char_off != self._card_hover_char_idx:
+            self._card_hover_char_idx = char_off
+            self._render_card()
+
+    def _card_leave(self, event):
+        """Handle mouse leave from card canvas — hide card."""
+        self._hide_card()
+
+    def _box_mousewheel(self, event, idx):
+        """Mousewheel over a box → cycle reading for the hovered token."""
+        if self._card_hover_char_idx < 0:
+            return
+        ki = self._card_data.get('kakasi_items', [])
+        # Map char_idx → chunk_idx
+        coff = 0
+        chunk_idx = -1
+        for ci, item in enumerate(ki):
+            orig = item.get('orig', '')
+            if coff <= self._card_hover_char_idx < coff + len(orig):
+                chunk_idx = ci
+                break
+            coff += len(orig)
+        if chunk_idx < 0 or chunk_idx >= len(ki):
+            return
+        item = ki[chunk_idx]
+        alts = item.get('alternatives', [])
+        if len(alts) <= 1:
+            return
+        delta = -1 if event.delta > 0 else 1
+        active = item.get('active_idx', 0)
+        active = (active + delta) % len(alts)
+        item['active_idx'] = active
+        item['hira'] = alts[active]['hira']
+        item['hepburn'] = alts[active]['hepburn']
+        self._card_data['romaji'] = " ".join([it['hepburn'] for it in ki])
+        self._render_card()
+
+    def _hide_card(self):
+        """Destroy the card Toplevel if visible."""
+        if self._card_window:
+            try:
+                self._card_window.destroy()
+            except Exception:
+                pass
+            self._card_window = None
+            self._card_canvas = None
+        self._card_data = None
+        self._card_data_idx = -1
+        self._card_box = None
+        self._card_token_positions = []
+        self._card_romaji_positions = []
+        self._card_hover_char_idx = -1
+        self._selection_box_idx = -1
+        self._selection_start = -1
+        self._selection_end = -1
+        for _, c, _ in self._box_windows:
+            try:
+                c.delete("word_hl")
+                c.delete("sel_hl")
+            except Exception:
+                pass
 
     def read_aloud(self, text):
-        import asyncio
-        import tempfile
-        # Use Windows MCI (winmm.dll) to play MP3 silently without external player
-        try:
-            import edge_tts
-        except ImportError:
-            print("edge-tts not installed — run: pip install edge-tts")
-            return
+        return  # TTS temporarily disabled
 
         tmp = tempfile.mktemp(suffix=".mp3")
         try:
@@ -1514,30 +1495,84 @@ class ScreenFreezerApp:
                 pass
 
     def unfreeze_screen(self):
-        if self.active_window:
-            self.active_window.destroy()
+        if not self.active:
+            return
+        self.active = False
+        self._destroy_box_windows()
+        if hasattr(self, 'snip_window') and self.snip_window:
+            self._close_snip()
+        if hasattr(self, 'active_window') and self.active_window:
+            try:
+                self.active_window.destroy()
+            except Exception:
+                pass
             self.active_window = None
             self.overlay_hwnd = None
-            self.overlay_visible = True
-            self.tk_img = None
-            self.pil_img = None
-            self.crop_tk_imgs = []
-            self.ocr_boxes = []
-            self.current_hover_idx = -1
-            self.hover_window_id = None
-            self.highlight_refs = []
-            self.is_dragging = False
-            self.selection_box_idx = -1
-            self.selection_start = -1
-            self.selection_end = -1
-            self.selection_overlays = []
+        if self._loading_win:
+            try:
+                self._loading_win.destroy()
+            except Exception:
+                pass
+            self._loading_win = None
+            self._load_tk_img = None
+        if self._prev_focus_hwnd:
+            try:
+                user32.SetForegroundWindow(self._prev_focus_hwnd)
+            except Exception:
+                pass
+        self._prev_focus_hwnd = None
+        self._overlay_hidden = False
+        self.pil_img = None
+        self.crop_tk_imgs = []
+        self.ocr_boxes = []
+        self.current_hover_idx = -1
+        self._card_data = None
+        self._card_data_idx = -1
+        self._card_box = None
+        self._card_token_positions = []
+        self._card_romaji_positions = []
+        self._card_hover_char_idx = -1
+        self._selection_box_idx = -1
+        self._selection_start = -1
+        self._selection_end = -1
 
-        # Restore focus to the previously active window
-        if self.previous_hwnd:
-            ctypes.windll.user32.SetForegroundWindow(self.previous_hwnd)
-            self.previous_hwnd = None
+    def check_focus(self):
+        if not self.active:
+            self.root.after(500, self.check_focus)
+            return
+        fg = user32.GetForegroundWindow()
+        all_hwnds = {self._prev_focus_hwnd}
+        for win, _, _ in self._box_windows:
+            try:
+                all_hwnds.add(user32.GetAncestor(win.winfo_id(), 2))
+            except Exception:
+                pass
+        if self._card_window:
+            try:
+                all_hwnds.add(user32.GetAncestor(self._card_window.winfo_id(), 2))
+            except Exception:
+                pass
+        if fg not in all_hwnds:
+            if not self._overlay_hidden:
+                self._overlay_hidden = True
+                for win, _, _ in self._box_windows:
+                    try:
+                        win.withdraw()
+                    except Exception:
+                        pass
+                self._hide_card()
+        else:
+            if self._overlay_hidden:
+                self._overlay_hidden = False
+                for win, _, _ in self._box_windows:
+                    try:
+                        win.deiconify()
+                    except Exception:
+                        pass
+        self.root.after(500, self.check_focus)
 
     def run(self):
+        self.check_focus()
         self.root.mainloop()
 
 # ── Win32 RegisterHotKey (works across elevation & fullscreen) ────────────────
