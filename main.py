@@ -1166,34 +1166,51 @@ class ScreenFreezerApp:
         words = self.ocr_boxes[box_idx].get('words', [])
         return ''.join(w['text'] for wi, w in enumerate(words) if start <= wi <= end)
 
-    def _box_right_click(self, event, idx):
-        """Right-click on a box → open in Jisho (selected text or full box)."""
+    def _get_hovered_chunk_text(self):
+        """Return the orig text of the hovered kakasi chunk, or None."""
+        if self._card_hover_char_idx < 0 or not self._card_data:
+            return None
+        ki = self._card_data.get('kakasi_items', [])
+        coff = 0
+        for item in ki:
+            orig = item.get('orig', '')
+            if coff <= self._card_hover_char_idx < coff + len(orig):
+                return orig.strip()
+            coff += len(orig)
+        return None
+
+    def _get_action_text(self, idx):
+        """Return selected text, or hovered chunk text, or None."""
         text = self._get_selected_text()
-        if not text:
-            if 0 <= idx < len(self.ocr_boxes):
-                text = self.ocr_boxes[idx]['data']['original']
+        if text:
+            return text
+        text = self._get_hovered_chunk_text()
+        if text:
+            return text
+        if 0 <= idx < len(self.ocr_boxes):
+            text = self.ocr_boxes[idx]['data']['original']
+            return text.strip()
+        return None
+
+    def _box_right_click(self, event, idx):
+        """Right-click on a box → open in Jisho."""
+        text = self._get_action_text(idx)
         if text:
             import webbrowser, urllib.parse
             url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
             webbrowser.open(url)
 
     def _box_shift_right_click(self, event, idx):
-        """Shift+Right-click on a box → open in DeepL (selected text or full box)."""
-        text = self._get_selected_text()
-        if not text:
-            if 0 <= idx < len(self.ocr_boxes):
-                text = self.ocr_boxes[idx]['data']['original']
+        """Shift+Right-click on a box → open in DeepL."""
+        text = self._get_action_text(idx)
         if text:
             import webbrowser, urllib.parse
             url = f"https://www.deepl.com/en/translator#ja/en/{urllib.parse.quote(text)}"
             webbrowser.open(url)
 
     def _box_middle_click(self, event, idx):
-        """Middle-click on a box → TTS (selected text or full box)."""
-        text = self._get_selected_text()
-        if not text:
-            if 0 <= idx < len(self.ocr_boxes):
-                text = self.ocr_boxes[idx]['data']['original']
+        """Middle-click on a box → TTS."""
+        text = self._get_action_text(idx)
         if text:
             threading.Thread(target=self.read_aloud, args=(text,), daemon=True).start()
 
