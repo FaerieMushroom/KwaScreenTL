@@ -383,6 +383,7 @@ class ScreenFreezerApp:
         self._card_romaji_positions = []
         self._card_hover_char_idx = -1
         self._dict_lookup_seq = 0
+        self._ctrl_held = False
         self._prev_focus_hwnd = None
         self._loading_win = None
         self._overlay_hidden = False
@@ -1148,7 +1149,7 @@ class ScreenFreezerApp:
                                     fill="#007aff", stipple="gray50", outline="",
                                     tags="sel_hl")
 
-    def _box_release(self, _event, idx):
+    def _box_release(self, event, idx):
         """Mouse release on a box → finalize selection."""
         if not self.is_dragging or self._selection_box_idx != idx:
             return
@@ -1162,7 +1163,9 @@ class ScreenFreezerApp:
             elapsed = time.time() - getattr(self, '_click_time', 0)
             if elapsed < 0.1 and hasattr(self, '_click_char_off'):
                 self._card_hover_char_idx = self._click_char_off
-                self._update_dict_card()
+                ctrl = bool(event.state & 4)
+                print(f"[DICT DEBUG] box_release click: elapsed={elapsed:.3f}s char_off={self._click_char_off} ctrl={ctrl} state={event.state}")
+                self._update_dict_card(single_char=ctrl)
             _, canvas2 = self._box_windows[idx][:2]
             canvas2.delete("sel_hl")
             self._selection_box_idx = -1
@@ -1211,27 +1214,44 @@ class ScreenFreezerApp:
             coff += len(orig)
         return None
 
-    def _update_dict_card(self):
+    def _get_hovered_single_char(self):
+        """Return the single character at the hovered position, or None."""
+        if self._card_hover_char_idx < 0 or not self._card_data:
+            return None
+        ki = self._card_data.get('kakasi_items', [])
+        coff = 0
+        for item in ki:
+            orig = item.get('orig', '')
+            if coff <= self._card_hover_char_idx < coff + len(orig):
+                offset = self._card_hover_char_idx - coff
+                if 0 <= offset < len(orig):
+                    return orig[offset]
+                return None
+            coff += len(orig)
+        return None
+
+    def _update_dict_card(self, single_char=False):
         """Start async dictionary lookup for the hovered word."""
         if self._card_hover_char_idx < 0 or not self._card_box:
             self._withdraw_dict_card()
             return
 
-        word = self._get_hovered_chunk_dict_form()
+        word = self._get_hovered_single_char() if single_char else self._get_hovered_chunk_dict_form()
+        print(f"[DICT DEBUG] _update_dict_card: single_char={single_char} hover_idx={self._card_hover_char_idx} word='{word}'")
         if not word or not contains_japanese(word):
             self._withdraw_dict_card()
             return
 
-        card_w = max(self._card_box.get('w', 200), 200)
+        card_w = max(self._card_box.get('w', 200), 200, 340)
         self._dict_lookup_seq += 1
         seq = self._dict_lookup_seq
         self._withdraw_dict_card()
 
         import threading
-        t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq), daemon=True)
+        t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq, single_char), daemon=True)
         t.start()
 
-    def _dict_lookup_thread(self, word, card_w, seq):
+    def _dict_lookup_thread(self, word, card_w, seq, single_char=False):
         """Background thread: perform jamdict lookup and post result to main thread."""
         try:
             jam = _get_jam()
@@ -1259,15 +1279,17 @@ class ScreenFreezerApp:
                 self.root.after(0, self._dict_lookup_skip, seq)
                 return
 
-            self.root.after(0, self._dict_lookup_show, word, card_w, seq, res, kanji_data)
+            self.root.after(0, self._dict_lookup_show, word, card_w, seq, res, kanji_data, single_char)
         except Exception:
             self.root.after(0, self._dict_lookup_skip, seq)
 
-    def _dict_lookup_show(self, word, card_w, seq, res, kanji_data):
+    def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False):
         """Main thread: render dict card from lookup results."""
         if seq != self._dict_lookup_seq:
             return
-        if self._get_hovered_chunk_dict_form() != word:
+        current = self._get_hovered_single_char() if single_char else self._get_hovered_chunk_dict_form()
+        print(f"[DICT DEBUG] _dict_lookup_show: word='{word}' single_char={single_char} current='{current}'")
+        if current != word:
             self._withdraw_dict_card()
             return
 
@@ -1692,20 +1714,28 @@ class ScreenFreezerApp:
 
         # Draw highlight for hovered word, then raise text above it
         if hover_chunk_idx >= 0:
-            for x1, x2, idx in self._card_token_positions:
-                if idx == hover_chunk_idx:
-                    canvas.create_rectangle(
-                        x1 - 1, jp_y + 1, x2 + 1, jp_text_bottom - 1,
-                        fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
-                    )
-                    if self.show_romaji:
-                        for rx, rw, ri in self._card_romaji_positions:
-                            if ri == hover_chunk_idx:
-                                canvas.create_rectangle(
-                                    rx - 1, rom_y + 1, rx + rw + 1, rom_y + 17,
-                                    fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
+            if self._ctrl_held and self._card_hover_char_idx >= 0:
+                hx1 = kf.measure(full_text[:self._card_hover_char_idx]) + pad_x
+                hx2 = kf.measure(full_text[:self._card_hover_char_idx + 1]) + pad_x
+                canvas.create_rectangle(
+                    hx1 - 1, jp_y + 1, hx2 + 1, jp_text_bottom - 1,
+                    fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
+                )
+            else:
+                for x1, x2, idx in self._card_token_positions:
+                    if idx == hover_chunk_idx:
+                        canvas.create_rectangle(
+                            x1 - 1, jp_y + 1, x2 + 1, jp_text_bottom - 1,
+                            fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
                         )
-                    break
+                        if self.show_romaji:
+                            for rx, rw, ri in self._card_romaji_positions:
+                                if ri == hover_chunk_idx:
+                                    canvas.create_rectangle(
+                                        rx - 1, rom_y + 1, rx + rw + 1, rom_y + 17,
+                                        fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
+                            )
+                        break
             canvas.tag_raise("jp_text")
             canvas.tag_raise("furigana")
             canvas.tag_raise("romaji_text")
@@ -1715,6 +1745,7 @@ class ScreenFreezerApp:
         """Mouse moved over a box canvas → find OCR word under cursor, highlight on card."""
         if idx < 0 or idx >= len(self.ocr_boxes):
             return
+        self._ctrl_held = bool(event.state & 4)
         box = self.ocr_boxes[idx]
         bbox = box['orig_bbox']
         words = box.get('words', [])
