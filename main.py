@@ -1019,6 +1019,8 @@ class ScreenFreezerApp:
             canvas.bind("<B1-Motion>", lambda e, i=idx: self._box_drag(e, i))
             canvas.bind("<ButtonRelease-1>", lambda e, i=idx: self._box_release(e, i))
             canvas.bind("<Button-3>", lambda e, i=idx: self._box_right_click(e, i))
+            canvas.bind("<Shift-Button-3>", lambda e, i=idx: self._box_shift_right_click(e, i))
+            canvas.bind("<Button-2>", lambda e, i=idx: self._box_middle_click(e, i))
 
             # Escape on the box window itself
             win.bind("<Escape>", lambda e: self.unfreeze_screen())
@@ -1157,14 +1159,46 @@ class ScreenFreezerApp:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(selected)
 
+    def _get_selected_text(self):
+        """Return the currently selected text, or None."""
+        box_idx = self._selection_box_idx
+        if box_idx < 0 or self._selection_start < 0 or self._selection_end < 0:
+            return None
+        start = min(self._selection_start, self._selection_end)
+        end = max(self._selection_start, self._selection_end)
+        words = self.ocr_boxes[box_idx].get('words', [])
+        return ''.join(w['text'] for wi, w in enumerate(words) if start <= wi <= end)
+
     def _box_right_click(self, event, idx):
-        """Right-click on a box → open in Jisho."""
-        if 0 <= idx < len(self.ocr_boxes):
-            text = self.ocr_boxes[idx]['data']['original']
-            if text:
-                import webbrowser, urllib.parse
-                url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
-                webbrowser.open(url)
+        """Right-click on a box → open in Jisho (selected text or full box)."""
+        text = self._get_selected_text()
+        if not text:
+            if 0 <= idx < len(self.ocr_boxes):
+                text = self.ocr_boxes[idx]['data']['original']
+        if text:
+            import webbrowser, urllib.parse
+            url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
+            webbrowser.open(url)
+
+    def _box_shift_right_click(self, event, idx):
+        """Shift+Right-click on a box → open in DeepL (selected text or full box)."""
+        text = self._get_selected_text()
+        if not text:
+            if 0 <= idx < len(self.ocr_boxes):
+                text = self.ocr_boxes[idx]['data']['original']
+        if text:
+            import webbrowser, urllib.parse
+            url = f"https://www.deepl.com/en/translator#ja/en/{urllib.parse.quote(text)}"
+            webbrowser.open(url)
+
+    def _box_middle_click(self, event, idx):
+        """Middle-click on a box → TTS (selected text or full box)."""
+        text = self._get_selected_text()
+        if not text:
+            if 0 <= idx < len(self.ocr_boxes):
+                text = self.ocr_boxes[idx]['data']['original']
+        if text:
+            threading.Thread(target=self.read_aloud, args=(text,), daemon=True).start()
 
     def _show_card(self, idx):
         """Display the translation card as a separate Toplevel near the hovered box."""
@@ -1471,8 +1505,6 @@ class ScreenFreezerApp:
                 pass
 
     def read_aloud(self, text):
-        return  # TTS temporarily disabled
-
         tmp = tempfile.mktemp(suffix=".mp3")
         try:
             async def _save():
