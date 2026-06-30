@@ -721,58 +721,25 @@ class ScreenFreezerApp:
         screen_rect = (ml + x1, mt + y1, ml + x2, mt + y2)
         self._close_snip()
 
-        self.freeze_screen_region(screen_rect)
+        self.freeze_screen_region(screen_rect, ml, mt)
 
-    def freeze_screen_region(self, screen_rect):
+    def freeze_screen_region(self, screen_rect, mx_off=0, my_off=0):
         """Freeze a user-selected region (screen coords: left, top, right, bottom)."""
         left, top, right, bottom = screen_rect
         w, h = right - left, bottom - top
 
-        self.active_window = tk.Toplevel(self.root)
-        self.active_window.overrideredirect(True)
-        self.active_window.geometry(f"{w}x{h}+{left}+{top}")
+        self.overlay_x = left
+        self.overlay_y = top
+        self.overlay_w = w
+        self.overlay_h = h
+        self.active = True
 
-        self.canvas = tk.Canvas(self.active_window, borderwidth=0, highlightthickness=0, bg="black")
-        self.canvas.pack(fill="both", expand=True)
-
-        self.active_window.update_idletasks()
-        self.overlay_hwnd = user32.GetAncestor(self.active_window.winfo_id(), 2)
-        self.overlay_visible = True
-
-        # Show cropped region as background
-        mx_off = self.snip_monitor['left']
-        my_off = self.snip_monitor['top']
-        bg_crop = self.pil_img.crop((left - mx_off, top - my_off,
-                                      left - mx_off + w, top - my_off + h))
-        self.tk_img = ImageTk.PhotoImage(bg_crop)
-        self.canvas.create_image(0, 0, image=self.tk_img, anchor="nw")
-
-        # Blue border + loading indicator
-        self.canvas.create_rectangle(0, 0, w - 1, h - 1, outline="#007aff", width=2, tags="overlay_border")
-        self._loader_text = self.canvas.create_text(
-            w // 2, 25,
-            text="[ Running OCR / Translation... ]",
-            fill="#ffffff", font=("Segoe UI", 14, "bold"), justify="center"
-        )
-        self._loader_bg = self.canvas.create_rectangle(
-            w // 2 - 160, 8, w // 2 + 160, 46,
-            fill="#1c1c1e", outline="#3a3a3c", width=2
-        )
-        self.canvas.tag_raise(self._loader_text)
-
-        # Crop the full image to the selected region (for OCR processing)
-        mx_off = self.snip_monitor['left']
-        my_off = self.snip_monitor['top']
         win_local = {
             'x': left - mx_off,
             'y': top - my_off,
             'w': w,
             'h': h,
         }
-
-        self.active_window.bind("<Escape>", lambda e: self.unfreeze_screen())
-        self.active_window.attributes("-topmost", True)
-        self.active = True
 
         threading.Thread(
             target=self.process_ocr,
@@ -2091,12 +2058,16 @@ def register_hotkey_win32(app):
         user32.DispatchMessageW(ctypes.byref(msg))
 
 def main():
+    print("Application started.")
+    print("  Ctrl+Alt+Shift+E  Capture game window for OCR / translation")
+    print("  Ctrl+Alt+Shift+R  Snip mode (drag-select a region)")
+    print("  Ctrl+Alt+Shift+S  Settings panel")
+    print("  Press Escape while frozen to unfreeze and restore focus.")
+
     app = ScreenFreezerApp()
 
     # Start Win32 hotkey thread (RegisterHotKey with fallback to GetAsyncKeyState)
     threading.Thread(target=register_hotkey_win32, args=(app,), daemon=True).start()
-
-    pass
 
     try:
         app.run()
