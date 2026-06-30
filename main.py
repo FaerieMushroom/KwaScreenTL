@@ -1268,7 +1268,11 @@ class ScreenFreezerApp:
                 if char_obj:
                     kanji_data.append(char_obj)
 
-            if not res.entries and (len(word) != 1 or not res.chars):
+            if single_char:
+                if not kanji_data:
+                    self.root.after(0, self._dict_lookup_skip, seq)
+                    return
+            elif not res.entries:
                 self.root.after(0, self._dict_lookup_skip, seq)
                 return
 
@@ -1309,17 +1313,23 @@ class ScreenFreezerApp:
         canvas = self._dict_canvas
         canvas.delete("all")
 
+        if single_char:
+            card_w = max(card_w, 400)
+
         title_font = (self.japanese_font, 11, "bold")
         body_font = ("Segoe UI", 10)
         pos_font = ("Segoe UI", 8, "italic")
         kanji_info_font = (self.japanese_font, 9)
+        jp_font = (self.japanese_font, 10)
 
         tf = tkfont.Font(font=title_font)
         bf = tkfont.Font(font=body_font)
         pf = tkfont.Font(font=pos_font)
+        jf = tkfont.Font(font=jp_font)
         title_h = tf.metrics("linespace")
         body_h = bf.metrics("linespace")
         pos_h = pf.metrics("linespace")
+        jp_h = jf.metrics("linespace")
 
         def _nlines(font_obj, text, wrap_width):
             if not text:
@@ -1334,35 +1344,36 @@ class ScreenFreezerApp:
 
         canvas.create_rectangle(1, 0, card_w - 2, 0, outline="#e5e5ea", width=1, tags="border")
 
-        for entry in res.entries[:2]:
-            kanji_texts = [k.text for k in entry.kanji_forms]
-            kana_texts = [k.text for k in entry.kana_forms]
-            header = ""
-            if kanji_texts:
-                header += " / ".join(kanji_texts)
-            if kana_texts:
-                if header:
-                    header += f" ({', '.join(kana_texts)})"
-                else:
-                    header += ", ".join(kana_texts)
+        if not single_char:
+            for entry in res.entries[:2]:
+                kanji_texts = [k.text for k in entry.kanji_forms]
+                kana_texts = [k.text for k in entry.kana_forms]
+                header = ""
+                if kanji_texts:
+                    header += " / ".join(kanji_texts)
+                if kana_texts:
+                    if header:
+                        header += f" ({', '.join(kana_texts)})"
+                    else:
+                        header += ", ".join(kana_texts)
 
-            canvas.create_text(pad_x, ly, text=header, font=title_font, fill="#0066cc", anchor="nw", width=wrap_w)
-            ly += _nlines(tf, header, wrap_w) * title_h + 4
+                canvas.create_text(pad_x, ly, text=header, font=title_font, fill="#0066cc", anchor="nw", width=wrap_w)
+                ly += _nlines(tf, header, wrap_w) * title_h + 4
 
-            for si, sense in enumerate(entry.senses[:3]):
-                glosses = ", ".join(g.text for g in sense.gloss)
-                pos = " • ".join(sense.pos) if sense.pos else ""
+                for si, sense in enumerate(entry.senses[:3]):
+                    glosses = ", ".join(g.text for g in sense.gloss)
+                    pos = " • ".join(sense.pos) if sense.pos else ""
 
-                if pos:
-                    canvas.create_text(pad_x + 6, ly, text=pos, font=pos_font, fill="#8e8e93", anchor="nw", width=wrap_w_inner)
-                    ly += _nlines(pf, pos, wrap_w_inner) * pos_h + 2
+                    if pos:
+                        canvas.create_text(pad_x + 6, ly, text=pos, font=pos_font, fill="#8e8e93", anchor="nw", width=wrap_w_inner)
+                        ly += _nlines(pf, pos, wrap_w_inner) * pos_h + 2
 
-                def_text = f"{si + 1}. {glosses}"
-                canvas.create_text(pad_x + 6, ly, text=def_text, font=body_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
-                ly += _nlines(bf, def_text, wrap_w_inner) * body_h + 4
+                    def_text = f"{si + 1}. {glosses}"
+                    canvas.create_text(pad_x + 6, ly, text=def_text, font=body_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
+                    ly += _nlines(bf, def_text, wrap_w_inner) * body_h + 4
 
         kanji_chars = [c for c in word if _is_kanji(c)]
-        if kanji_chars:
+        if single_char and kanji_chars:
             unique_kanjis = []
             seen_k = set()
             for c in kanji_chars:
@@ -1370,8 +1381,12 @@ class ScreenFreezerApp:
                     seen_k.add(c)
                     unique_kanjis.append(c)
 
-            kanji_info_lines = []
-            for uk in unique_kanjis:
+            for ui, uk in enumerate(unique_kanjis):
+                if ui > 0:
+                    ly += 6
+                    canvas.create_line(pad_x, ly, card_w - pad_x, ly, fill="#e5e5ea")
+                    ly += 8
+
                 char_obj = None
                 for c_obj in kanji_data:
                     if c_obj.literal == uk:
@@ -1407,29 +1422,39 @@ class ScreenFreezerApp:
                         else:
                             jlpt_str = f"L{jlpt}"
 
-                    parts = []
+                    # Blue kanji title
+                    canvas.create_text(pad_x, ly, text=f"{uk} — Kanji Info", font=title_font, fill="#0066cc", anchor="nw")
+                    ly += title_h + 4
+
+                    # Meta info line (JLPT, Grade, strokes)
+                    meta_parts = []
                     if jlpt_str:
-                        parts.append(f"JLPT: {jlpt_str}")
+                        meta_parts.append(f"JLPT: {jlpt_str}")
                     if grade is not None:
                         grade_str = f"G{grade}"
                         if 1 <= grade <= 6:
                             grade_str += " (Elem)"
                         elif grade == 8:
                             grade_str += " (Sec)"
-                        parts.append(f"Grade: {grade_str}")
+                        meta_parts.append(f"Grade: {grade_str}")
                     if strokes is not None:
-                        parts.append(f"{strokes} strokes")
+                        meta_parts.append(f"{strokes} strokes")
+                    if meta_parts:
+                        meta_text = " • ".join(meta_parts)
+                        canvas.create_text(pad_x + 6, ly, text=meta_text, font=pos_font, fill="#8e8e93", anchor="nw", width=wrap_w_inner)
+                        ly += _nlines(pf, meta_text, wrap_w_inner) * pos_h + 4
 
-                    info_text = f"{uk} : " + ", ".join(parts) if parts else f"{uk}"
-                    kanji_info_lines.append(info_text)
-
+                    # Meanings
                     try:
                         eng = _get_english_meanings(uk)
                         if eng:
-                            kanji_info_lines.append(f"  Meanings: {', '.join(eng)}")
+                            content = ", ".join(eng)
+                            canvas.create_text(pad_x + 6, ly, text=content, font=body_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
+                            ly += _nlines(bf, content, wrap_w_inner) * body_h + 4
                     except Exception:
                         pass
 
+                    # On and Kun readings
                     try:
                         rm_groups = getattr(char_obj, 'rm_groups', [])
                         if rm_groups:
@@ -1441,73 +1466,19 @@ class ScreenFreezerApp:
                                 for r in getattr(g, 'kun_readings', []) or []:
                                     kun_all.append(str(r))
                             if on_all:
-                                kanji_info_lines.append(f"  On: {' • '.join(on_all)}")
+                                on_content = " • ".join(on_all)
+                                canvas.create_text(pad_x + 6, ly, text="On:", font=("Segoe UI", 10, "bold"), fill="#8e8e93", anchor="nw")
+                                ly += jp_h + 1
+                                canvas.create_text(pad_x + 6, ly, text=on_content, font=jp_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
+                                ly += _nlines(jf, on_content, wrap_w_inner) * jp_h + 4
                             if kun_all:
-                                kanji_info_lines.append(f"  Kun: {' • '.join(kun_all)}")
+                                kun_content = " • ".join(kun_all)
+                                canvas.create_text(pad_x + 6, ly, text="Kun:", font=("Segoe UI", 10, "bold"), fill="#8e8e93", anchor="nw")
+                                ly += jp_h + 1
+                                canvas.create_text(pad_x + 6, ly, text=kun_content, font=jp_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
+                                ly += _nlines(jf, kun_content, wrap_w_inner) * jp_h + 4
                     except Exception:
                         pass
-
-            if kanji_info_lines:
-                ly += 2
-                canvas.create_line(pad_x, ly, card_w - pad_x, ly, fill="#e5e5ea")
-                ly += 6
-                canvas.create_text(pad_x, ly, text="Kanji Info:", font=("Segoe UI", 9, "bold"), fill="#8e8e93", anchor="nw")
-                ly += 16
-                for kil in kanji_info_lines:
-                    segments = _segment_jp(kil)
-                    # Measure total rendered width
-                    total_w = 0
-                    seg_metrics = []
-                    for seg_text, is_jp in segments:
-                        sf = (self.japanese_font, 8, "bold") if is_jp else ("Segoe UI", 8)
-                        fo = tkfont.Font(font=sf)
-                        sw = fo.measure(seg_text)
-                        seg_metrics.append((seg_text, is_jp, sf, fo, sw))
-                        total_w += sw
-
-                    if total_w <= wrap_w_inner:
-                        # Single line - segment-by-segment rendering
-                        sx = pad_x + 6
-                        line_h = 0
-                        for seg_text, is_jp, sf, fo, sw in seg_metrics:
-                            line_h = max(line_h, fo.metrics("linespace"))
-                            canvas.create_text(sx, ly, text=seg_text, font=sf, fill="#3a3a3c", anchor="nw")
-                            sx += sw
-                        ly += line_h + 2
-                    else:
-                        # Multi-line wrapping with word-wrap
-                        jp_count = sum(len(s) for s, _ in segments if _)
-                        en_count = sum(len(s) for s, _ in segments if not _)
-                        base_font = (self.japanese_font, 8) if jp_count > en_count else ("Segoe UI", 8)
-                        fo = tkfont.Font(font=base_font)
-                        lh = fo.metrics("linespace")
-                        words = kil.split(' ')
-                        line = ''
-                        for w in words:
-                            test = line + (' ' if line else '') + w
-                            if fo.measure(test) <= wrap_w_inner:
-                                line = test
-                            else:
-                                if line:
-                                    canvas.create_text(pad_x + 6, ly, text=line, font=base_font, fill="#3a3a3c", anchor="nw")
-                                    ly += lh + 2
-                                # Handle a word wider than the card
-                                if fo.measure(w) > wrap_w_inner:
-                                    chunk = ''
-                                    for ch in w:
-                                        test_ch = chunk + ch
-                                        if chunk and fo.measure(test_ch) > wrap_w_inner:
-                                            canvas.create_text(pad_x + 6, ly, text=chunk, font=base_font, fill="#3a3a3c", anchor="nw")
-                                            ly += lh + 2
-                                            chunk = ch
-                                        else:
-                                            chunk = test_ch
-                                    line = chunk
-                                else:
-                                    line = w
-                        if line:
-                            canvas.create_text(pad_x + 6, ly, text=line, font=base_font, fill="#3a3a3c", anchor="nw")
-                            ly += lh + 2
 
         canvas.update_idletasks()
         bbox = canvas.bbox("all")
