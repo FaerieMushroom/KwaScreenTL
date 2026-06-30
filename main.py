@@ -462,7 +462,76 @@ class ScreenFreezerApp:
         # Start checking the queue for trigger events or translation results
         self.root.after(100, self.check_queue)
 
+    def _on_ctrl_key(self, held):
+        if self._ctrl_held == held:
+            return
+        self._ctrl_held = held
+        self._refresh_highlights()
 
+    def _is_ctrl_held(self):
+        try:
+            return bool(user32.GetAsyncKeyState(0xA2) & 0x8000) or bool(user32.GetAsyncKeyState(0xA3) & 0x8000)
+        except Exception:
+            return self._ctrl_held
+
+    def _poll_ctrl_state(self):
+        ctrl = self._is_ctrl_held()
+        if ctrl != self._ctrl_held:
+            self._ctrl_held = ctrl
+            self._refresh_highlights()
+
+    def _refresh_highlights(self):
+        if self._card_window and self._card_hover_char_idx >= 0:
+            self._render_card()
+            idx = self.current_hover_idx
+            if 0 <= idx < len(self.ocr_boxes):
+                self._redraw_box_highlight(idx, self._card_hover_char_idx)
+
+    def _redraw_box_highlight(self, idx, char_off):
+        box = self.ocr_boxes[idx]
+        bbox = box['orig_bbox']
+        words = box.get('words', [])
+        _, canvas2 = self._box_windows[idx][:2]
+        canvas2.delete("word_hl")
+        ki = box['data'].get('kakasi_items', [])
+        if not ki:
+            return
+        if self._is_ctrl_held():
+            wcoff = 0
+            for w in words:
+                wlen = len(w['text'])
+                if wcoff <= char_off < wcoff + wlen:
+                    lx = w['x'] - bbox['x']
+                    ly = w['y'] - bbox['y']
+                    canvas2.create_rectangle(
+                        lx, ly, lx + w['width'], ly + w['height'],
+                        fill="#ffe082", stipple="gray25", outline="",
+                        tags="word_hl")
+                    break
+                wcoff += wlen
+        else:
+            ci_off = 0
+            chunk_cs = -1
+            chunk_ce = -1
+            for item in ki:
+                orig_len = len(item.get('orig', ''))
+                if ci_off <= char_off < ci_off + orig_len:
+                    chunk_cs = ci_off
+                    chunk_ce = ci_off + orig_len
+                    break
+                ci_off += orig_len
+            if chunk_cs >= 0:
+                wcoff = 0
+                for w in words:
+                    wlen = len(w['text'])
+                    if wcoff < chunk_ce and wcoff + wlen > chunk_cs:
+                        lx = w['x'] - bbox['x']
+                        ly = w['y'] - bbox['y']
+                        canvas2.create_rectangle(
+                            lx, ly, lx + w['width'], ly + w['height'],
+                            fill="#ffe082", stipple="gray25", outline="",
+                            tags="word_hl")
+                    wcoff += wlen
 
     def check_queue(self):
         try:
@@ -481,6 +550,7 @@ class ScreenFreezerApp:
                     self.toggle_settings()
         except queue.Empty:
             pass
+        self._poll_ctrl_state()
         self.root.after(50, self.check_queue)
 
     def trigger(self):
@@ -1045,6 +1115,10 @@ class ScreenFreezerApp:
 
             # Escape on the box window itself
             win.bind("<Escape>", lambda e: self.unfreeze_screen())
+            win.bind("<KeyPress-Control_L>", lambda e: self._on_ctrl_key(True))
+            win.bind("<KeyPress-Control_R>", lambda e: self._on_ctrl_key(True))
+            win.bind("<KeyRelease-Control_L>", lambda e: self._on_ctrl_key(False))
+            win.bind("<KeyRelease-Control_R>", lambda e: self._on_ctrl_key(False))
 
             self._box_windows.append((win, canvas, idx))
 
@@ -1063,6 +1137,10 @@ class ScreenFreezerApp:
         if self.current_hover_idx != idx:
             self._hide_card()
             self.current_hover_idx = idx
+            try:
+                self._box_windows[idx][0].focus_force()
+            except Exception:
+                pass
         # Highlight this box, reset others
         for _, canvas, i in self._box_windows:
             color = "#ff9500" if i == idx else "#007aff"
@@ -1168,11 +1246,9 @@ class ScreenFreezerApp:
         end = max(self._selection_start, self._selection_end)
         words = self.ocr_boxes[idx].get('words', [])
         if start == end:
-            elapsed = time.time() - getattr(self, '_click_time', 0)
-            if elapsed < 0.1 and hasattr(self, '_click_char_off'):
+            if hasattr(self, '_click_char_off'):
                 self._card_hover_char_idx = self._click_char_off
-                ctrl = bool(event.state & 4)
-                pass
+                ctrl = self._is_ctrl_held()
                 self._update_dict_card(single_char=ctrl)
             _, canvas2 = self._box_windows[idx][:2]
             canvas2.delete("sel_hl")
@@ -1788,13 +1864,21 @@ class ScreenFreezerApp:
 
         # Draw highlight for hovered word, then raise text above it
         if hover_chunk_idx >= 0:
-            if self._ctrl_held and self._card_hover_char_idx >= 0:
+            if self._is_ctrl_held() and self._card_hover_char_idx >= 0:
                 hx1 = kf.measure(full_text[:self._card_hover_char_idx]) + pad_x
                 hx2 = kf.measure(full_text[:self._card_hover_char_idx + 1]) + pad_x
                 canvas.create_rectangle(
                     hx1 - 1, jp_y + 1, hx2 + 1, jp_text_bottom - 1,
                     fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
                 )
+                if self.show_romaji:
+                    for rx, rw, ri in self._card_romaji_positions:
+                        if ri == hover_chunk_idx:
+                            canvas.create_rectangle(
+                                rx - 1, rom_y + 1, rx + rw + 1, rom_y + 17,
+                                fill="#fff3cd", outline="#ffc107", width=1, tags="highlight"
+                            )
+                            break
             else:
                 for x1, x2, idx in self._card_token_positions:
                     if idx == hover_chunk_idx:
@@ -1819,7 +1903,6 @@ class ScreenFreezerApp:
         """Mouse moved over a box canvas → find OCR word under cursor, highlight on card."""
         if idx < 0 or idx >= len(self.ocr_boxes):
             return
-        self._ctrl_held = bool(event.state & 4)
         box = self.ocr_boxes[idx]
         bbox = box['orig_bbox']
         words = box.get('words', [])
@@ -1839,34 +1922,7 @@ class ScreenFreezerApp:
         # Convert word index → character offset for kakasi_items mapping
         char_off = sum(len(words[j]['text']) for j in range(wi))
 
-        _, canvas2 = self._box_windows[idx][:2]
-        canvas2.delete("word_hl")
-
-        # Highlight all OCR words that fall within the same kakasi_items chunk
-        ki = box['data'].get('kakasi_items', [])
-        if ki:
-            ci_off = 0
-            chunk_cs = -1
-            chunk_ce = -1
-            for item in ki:
-                orig_len = len(item.get('orig', ''))
-                if ci_off <= char_off < ci_off + orig_len:
-                    chunk_cs = ci_off
-                    chunk_ce = ci_off + orig_len
-                    break
-                ci_off += orig_len
-            if chunk_cs >= 0:
-                wcoff = 0
-                for w in words:
-                    wlen = len(w['text'])
-                    if wcoff < chunk_ce and wcoff + wlen > chunk_cs:
-                        lx = w['x'] - bbox['x']
-                        ly = w['y'] - bbox['y']
-                        canvas2.create_rectangle(
-                            lx, ly, lx + w['width'], ly + w['height'],
-                            fill="#ffe082", stipple="gray25", outline="",
-                            tags="word_hl")
-                    wcoff += wlen
+        self._redraw_box_highlight(idx, char_off)
 
         if char_off != self._card_hover_char_idx:
             self._card_hover_char_idx = char_off
