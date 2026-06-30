@@ -352,7 +352,21 @@ def translate_and_convert(japanese_text, do_translate=True):
                     'alternatives': alternatives,
                     'active_idx': 0,
                 })
-        romaji = " ".join([item['hepburn'] for item in items])
+        # Fix sokuon gemination across token boundaries (入っ+てる→haitteru)
+        for i in range(len(items) - 1):
+            h1 = items[i].get('hepburn', '')
+            h2 = items[i+1].get('hepburn', '')
+            if h1.endswith('tsu') and h2 and h2[0] in 'bcdfghjklmnpqrstvwxyz':
+                items[i]['hepburn'] = h1[:-3]
+                items[i+1]['hepburn'] = h2[0] + h2
+                items[i]['_no_trail_space'] = True
+        romaji_parts = []
+        for i, item in enumerate(items):
+            h = item.get('hepburn', '') or item['orig']
+            if i > 0 and not items[i-1].get('_no_trail_space'):
+                romaji_parts.append(' ')
+            romaji_parts.append(h)
+        romaji = ''.join(romaji_parts)
         kana = " ".join([item['hira'] if item['hira'] else item['orig'] for item in items])
         
         # Translate to English
@@ -1710,13 +1724,29 @@ class ScreenFreezerApp:
                 rt = item.get('hepburn', '') or orig
                 rw = rf.measure(rt)
                 self._card_romaji_positions.append((rfx, rw, item_idx))
-                rfx += rw + rf.measure(' ')
+                rfx += rw
+                if not item.get('_no_trail_space'):
+                    rfx += rf.measure(' ')
 
             # Draw furigana for kanji tokens
             if orig != hira and any(_is_kanji(c) for c in orig):
-                cx = pad_x + prefix_w + group_w / 2
-                canvas.create_text(cx, fg_y + 2, text=hira, font=ff,
-                                   fill="#248a3d", anchor="n", tags="furigana")
+                okuri_count = 0
+                for ch in reversed(orig):
+                    if _is_kana(ch):
+                        okuri_count += 1
+                    else:
+                        break
+                if okuri_count > 0 and okuri_count < len(hira):
+                    k_orig = orig[:-okuri_count]
+                    k_hira = hira[:-okuri_count]
+                else:
+                    k_orig = orig
+                    k_hira = hira
+                if any(_is_kanji(c) for c in k_orig):
+                    kw = kf.measure(k_orig)
+                    cx = pad_x + prefix_w + kw / 2
+                    canvas.create_text(cx, fg_y + 2, text=k_hira, font=ff,
+                                       fill="#248a3d", anchor="n", tags="furigana")
             char_off += len(orig)
         ly = fg_y + fg_line_h + 2
 
