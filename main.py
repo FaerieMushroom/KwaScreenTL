@@ -207,6 +207,26 @@ def _is_kana(ch):
     """Check if a character is Hiragana or Katakana."""
     return '\u3040' <= ch <= '\u30ff'
 
+def _segment_jp(text):
+    """Split text into runs of (segment, is_japanese)."""
+    segments = []
+    cur = ""
+    in_jp = None
+    for ch in text:
+        is_jp = _is_kanji(ch) or _is_kana(ch)
+        if in_jp is None:
+            in_jp = is_jp
+            cur = ch
+        elif is_jp == in_jp:
+            cur += ch
+        else:
+            segments.append((cur, in_jp))
+            cur = ch
+            in_jp = is_jp
+    if cur:
+        segments.append((cur, in_jp))
+    return segments
+
 def _build_alternatives(orig, sudachi_hira):
     """Build list of alternative readings for a token using jamdict."""
     # Non-kanji tokens (kana/punctuation/symbols): no alternatives needed
@@ -1289,19 +1309,17 @@ class ScreenFreezerApp:
         canvas = self._dict_canvas
         canvas.delete("all")
 
-        title_font = ("Segoe UI", 11, "bold")
+        title_font = (self.japanese_font, 11, "bold")
         body_font = ("Segoe UI", 10)
         pos_font = ("Segoe UI", 8, "italic")
-        kanji_info_font = ("Segoe UI", 9)
+        kanji_info_font = (self.japanese_font, 9)
 
         tf = tkfont.Font(font=title_font)
         bf = tkfont.Font(font=body_font)
         pf = tkfont.Font(font=pos_font)
-        kf = tkfont.Font(font=kanji_info_font)
         title_h = tf.metrics("linespace")
         body_h = bf.metrics("linespace")
         pos_h = pf.metrics("linespace")
-        kanji_h = kf.metrics("linespace")
 
         def _nlines(font_obj, text, wrap_width):
             if not text:
@@ -1436,8 +1454,17 @@ class ScreenFreezerApp:
                 canvas.create_text(pad_x, ly, text="Kanji Info:", font=("Segoe UI", 9, "bold"), fill="#8e8e93", anchor="nw")
                 ly += 16
                 for kil in kanji_info_lines:
-                    canvas.create_text(pad_x + 6, ly, text=kil, font=kanji_info_font, fill="#3a3a3c", anchor="nw", width=wrap_w_inner)
-                    ly += _nlines(kf, kil, wrap_w_inner) * kanji_h + 2
+                    segments = _segment_jp(kil)
+                    # Render each segment with appropriate font, tracking x
+                    sx = pad_x + 6
+                    line_h = 0
+                    for seg_text, is_jp in segments:
+                        sf = (self.japanese_font, 8, "bold") if is_jp else ("Segoe UI", 8)
+                        font_o = tkfont.Font(font=sf)
+                        line_h = max(line_h, font_o.metrics("linespace"))
+                        canvas.create_text(sx, ly, text=seg_text, font=sf, fill="#3a3a3c", anchor="nw")
+                        sx += font_o.measure(seg_text)
+                    ly += line_h + 2
 
         canvas.update_idletasks()
         bbox = canvas.bbox("all")
