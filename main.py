@@ -1134,11 +1134,9 @@ class ScreenFreezerApp:
         self._show_card(idx)
 
     def _box_leave(self, idx):
-        """Mouse left a box window → hide card and reset highlights."""
+        """Mouse left a box window → reset highlights."""
         if self.is_dragging:
             return
-        if self.current_hover_idx == idx:
-            self._hide_card()
         for _, canvas, _ in self._box_windows:
             try:
                 canvas.itemconfig("box_border", outline="#007aff", width=BORDER_WIDTH)
@@ -1415,8 +1413,11 @@ class ScreenFreezerApp:
 
         if not single_char:
             entries = list(res.entries)
-            entries.sort(key=lambda e: 0 if any('particle' in (p or '') for s in e.senses for p in (s.pos or [])) else 1)
-            for entry in entries:
+            entries.sort(key=lambda e: (
+                0 if any(p == 'particle' for s in e.senses for p in (s.pos or []))
+                else (1 if not e.kanji_forms else 2)
+            ))
+            for entry in entries[:4]:
                 kanji_texts = [k.text for k in entry.kanji_forms]
                 kana_texts = [k.text for k in entry.kana_forms]
                 header = ""
@@ -1562,10 +1563,8 @@ class ScreenFreezerApp:
             screen_limit_y = self.root.winfo_screenheight()
         except Exception:
             pass
-        if dict_y + dict_h > screen_limit_y - 8:
-            dict_y = self.overlay_y - dict_h - 4
-            if dict_y < 8:
-                dict_y = self.overlay_y + self.overlay_h + 4
+        if dict_y + dict_h > screen_limit_y:
+            dict_y += screen_limit_y - (dict_y + dict_h)
 
         self._dict_window.geometry(f"{card_w}x{dict_h}+{dict_x}+{dict_y}")
         self._dict_window.lift()
