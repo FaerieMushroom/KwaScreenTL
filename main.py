@@ -11,6 +11,18 @@ import time
 # paddle/paddlex import, so it goes right at the top.
 os.environ["FLAGS_enable_pir_with_executor_in_serial_mode"] = "0"
 
+# ── Suppress noisy PaddleOCR/Paddle startup messages ──────────────────────────
+import warnings
+warnings.filterwarnings("ignore", message="No ccache found")
+os.environ.setdefault("GLOG_minloglevel", "3")         # suppress C++ glog entirely
+os.environ.setdefault("PADDLE_PDX_DEBUG", "0")         # suppress paddlex DEBUG
+os.environ.setdefault("PADDLEOCR_DISABLE_AUTO_LOGGING_CONFIG", "1")
+import logging
+logging.getLogger("ppocr").setLevel(logging.WARNING)
+logging.getLogger("paddlex").setLevel(logging.WARNING)
+logging.getLogger().setLevel(logging.WARNING)
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── OCR engine selector ──────────────────────────────────────────────────────
 # "windows" → WinOCR (Windows.Media.Ocr, fast but less accurate)
 # "paddle"  → PaddleOCR (deep-learning, more accurate, ~5s first-load)
@@ -22,17 +34,6 @@ OCR_ENGINE = "paddle"
 # "deepl"   → DeepL API  (online, needs key in deeplapikey.txt)
 TRANSLATOR = "deepl"
 # ─────────────────────────────────────────────────────────────────────────────
-
-# ── OCR upscale factors (multi-scale fusion) ──────────────────────────────────
-# Multiple scales are tried and results merged.  Lower scales catch large text
-# with good word grouping; higher scales catch small/corner text.
-# Tweak these to balance speed vs coverage.
-OCR_SCALES = [5, 7]
-
-# ── Snip-mode OCR scale (Ctrl+Alt+Shift+R) ──────────────────────────────────
-# Scale used when drag-selecting a custom region.  Can be different from
-# OCR_SCALES since snips are often smaller areas (less memory pressure).
-SNIP_OCR_SCALE = 5
 
 # ── Language filter ─────────────────────────────────────────────────────────
 # When True, non-Japanese OCR text (numbers, English UI) is skipped.
@@ -56,8 +57,6 @@ import tkinter as tk
 import tkinter.font as tkfont
 from PIL import Image, ImageTk
 import mss
-import onnxruntime  # must precede winocr to avoid WinRT DLL conflict
-import winocr
 import jaconv
 import pykakasi
 from jamdict import Jamdict
@@ -88,7 +87,10 @@ _paddle_ocr = None
 def get_paddle_ocr():
     global _paddle_ocr
     if _paddle_ocr is None:
+        import logging
         from paddleocr import PaddleOCR
+        logging.getLogger("ppocr").setLevel(logging.WARNING)
+        logging.getLogger("paddlex").setLevel(logging.WARNING)
         _paddle_ocr = PaddleOCR(
             lang='japan', engine='onnxruntime',
             use_doc_orientation_classify=False,
@@ -712,6 +714,7 @@ class ScreenFreezerApp:
         self.overlay_w = win_local['w']
         self.overlay_h = win_local['h']
         self.active = True
+        self._ocr_start_time = time.time()
 
         # Loading overlay: captured game region + blue border + status text
         win_crop = self.pil_img.crop((win_local['x'], win_local['y'],
@@ -844,6 +847,7 @@ class ScreenFreezerApp:
         self.overlay_w = w
         self.overlay_h = h
         self.active = True
+        self._ocr_start_time = time.time()
 
         win_local = {
             'x': left - mx_off,
@@ -854,7 +858,7 @@ class ScreenFreezerApp:
 
         threading.Thread(
             target=self.process_ocr,
-            args=(self.pil_img, win_local, SNIP_OCR_SCALE),
+            args=(self.pil_img, win_local),
             daemon=True
         ).start()
 
@@ -900,78 +904,13 @@ class ScreenFreezerApp:
                 })
         return lines
 
-    def run_ocr_at_scale(self, win_crop, scale):
-        """Run WinOCR at a given scale factor, return lines with bboxes in overlay coords."""
-        ocr_img = win_crop.resize(
-            (win_crop.width * scale, win_crop.height * scale),
-            Image.LANCZOS
-        )
-        ocr_res = winocr.recognize_pil_sync(ocr_img, 'ja')
-        lines = ocr_res.get('lines', [])
-        for line in lines:
-            for word in line.get('words', []):
-                br = word['bounding_rect']
-                br['x'] /= scale
-                br['y'] /= scale
-                br['width'] /= scale
-                br['height'] /= scale
-        return lines
-
-    def merge_lines(self, *line_sets):
-        """Merge lines from multiple OCR passes, keeping the best text per region."""
-        def iou(a, b):
-            x1 = max(a['x'], b['x'])
-            y1 = max(a['y'], b['y'])
-            x2 = min(a['x'] + a['width'], b['x'] + b['width'])
-            y2 = min(a['y'] + a['height'], b['y'] + b['height'])
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
-            inter = (x2 - x1) * (y2 - y1)
-            u = a['width'] * a['height'] + b['width'] * b['height'] - inter
-            return inter / u if u else 0.0
-
-        merged = []
-        for lines in line_sets:
-            for line in lines:
-                bbox = get_line_bounding_rect(line)
-                text = line.get('text', '').strip()
-                text_clean = re.sub(r'\s+', '', text)
-                if not text_clean:
-                    continue
-                if self.skip_non_japanese and not contains_japanese(text_clean):
-                    continue
-
-                # Check overlap with existing merged lines
-                found = False
-                for i, existing in enumerate(merged):
-                    eb = existing['bbox']
-                    if iou(bbox, eb) > 0.3:
-                        # Keep the line with longer text (more complete)
-                        existing_text = existing['line'].get('text', '').strip()
-                        existing_clean = re.sub(r'\s+', '', existing_text)
-                        if len(text_clean) > len(existing_clean):
-                            merged[i] = {'line': line, 'bbox': bbox}
-                        found = True
-                        break
-                if not found:
-                    merged.append({'line': line, 'bbox': bbox})
-        return [m['line'] for m in merged]
-
-    def process_ocr(self, pil_img, win_local, single_scale=None):
-        """Run OCR on the focused window crop only, then offset boxes to screen coords.
-           If single_scale is set, runs one pass at that scale (snip mode)."""
+    def process_ocr(self, pil_img, win_local):
+        """Run OCR on the focused window crop only, then offset boxes to screen coords."""
         win_x, win_y = win_local['x'], win_local['y']
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
         
         try:
-            engine = globals().get("OCR_ENGINE", "windows")
-            if engine == "paddle":
-                lines = self.run_ocr_paddle(win_crop)
-            else:
-                SCALES = [single_scale] if single_scale else globals().get("OCR_SCALES", [3, 7])
-                lines = self.merge_lines(
-                    *(self.run_ocr_at_scale(win_crop, s) for s in SCALES)
-                )
+            lines = self.run_ocr_paddle(win_crop)
             
             translation_targets = []
             for line in lines:
@@ -1029,7 +968,6 @@ class ScreenFreezerApp:
                         # Estimate height including cropped image height
                         h = bbox['height'] + 130 + (len(res['english']) // 40) * 16
                         
-                        print(f"[RESULT] orig='{res['original']}' english='{res['english']}'")
                         boxes.append({
                             'w': w,
                             'h': h,
@@ -1128,6 +1066,9 @@ class ScreenFreezerApp:
             win.bind("<KeyRelease-Control_R>", lambda e: self._on_ctrl_key(False))
 
             self._box_windows.append((win, canvas, idx))
+
+        elapsed = (time.time() - self._ocr_start_time) * 1000
+        print(f"OCR: {len(boxes)} regions, {elapsed:.0f}ms")
 
     def _destroy_box_windows(self):
         """Destroy all box windows and hide card."""
