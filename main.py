@@ -18,7 +18,7 @@ import sys
 import msvcrt
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 STD_ERROR_HANDLE = -12
-_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paddle.log")
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
 _log_fd = os.open(_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
 _log_handle = msvcrt.get_osfhandle(_log_fd)
 kernel32.SetStdHandle(STD_ERROR_HANDLE, _log_handle)
