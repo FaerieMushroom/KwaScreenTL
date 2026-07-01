@@ -1414,7 +1414,9 @@ class ScreenFreezerApp:
         wrap_w_inner = max(card_w - 22, 170)
 
         if not single_char:
-            for entry in res.entries[:2]:
+            entries = list(res.entries)
+            entries.sort(key=lambda e: 0 if any('particle' in (p or '') for s in e.senses for p in (s.pos or [])) else 1)
+            for entry in entries:
                 kanji_texts = [k.text for k in entry.kanji_forms]
                 kana_texts = [k.text for k in entry.kana_forms]
                 header = ""
