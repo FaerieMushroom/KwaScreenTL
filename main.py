@@ -619,6 +619,7 @@ class ScreenFreezerApp:
         self.root.withdraw()
         self.msg_queue = queue.Queue()
         self.active = False
+        self._ocr_gen = 0
         self.pil_img = None
         self.ocr_boxes = []
         self._box_windows = []          # list of (Toplevel, Canvas, idx) per OCR box
@@ -994,9 +995,10 @@ class ScreenFreezerApp:
             pass
 
         # Start OCR & Translation in background
+        self._ocr_gen += 1
         threading.Thread(
             target=self.process_ocr,
-            args=(self.pil_img, win_local),
+            args=(self.pil_img, win_local, self._ocr_gen),
             daemon=True
         ).start()
 
@@ -1004,7 +1006,14 @@ class ScreenFreezerApp:
 
     def enter_snip_mode(self):
         if self.active:
-            return
+            self.unfreeze_screen()
+        self._prev_focus_hwnd = user32.GetForegroundWindow()
+        # Force focus back to game window now so subsequent focus polls keep boxes visible
+        if self._prev_focus_hwnd:
+            try:
+                user32.SetForegroundWindow(self._prev_focus_hwnd)
+            except Exception:
+                pass
         sct_img, self.snip_monitor = capture_moused_monitor()
         self.pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
@@ -1101,9 +1110,10 @@ class ScreenFreezerApp:
             'h': h,
         }
 
+        self._ocr_gen += 1
         threading.Thread(
             target=self.process_ocr,
-            args=(self.pil_img, win_local),
+            args=(self.pil_img, win_local, self._ocr_gen),
             daemon=True
         ).start()
 
@@ -1157,8 +1167,9 @@ class ScreenFreezerApp:
                 })
         return lines
 
-    def process_ocr(self, pil_img, win_local):
-        """Run OCR on the focused window crop only, then offset boxes to screen coords."""
+    def process_ocr(self, pil_img, win_local, ocr_gen):
+        """Run OCR on the focused window crop only, then offset boxes to screen coords.
+        `ocr_gen` is a generation counter used to discard stale results if a new scan starts."""
         win_x, win_y = win_local['x'], win_local['y']
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
         
@@ -1213,6 +1224,8 @@ class ScreenFreezerApp:
                 })
 
             # Send boxes to main thread immediately (progressive rendering)
+            if self._ocr_gen != ocr_gen:
+                return
             self.msg_queue.put(("ocr_boxes_ready", boxes))
 
             # Phase 1: local processing (parallel, cached)
@@ -1267,12 +1280,15 @@ class ScreenFreezerApp:
                 self._last_translation_ms = 0
 
             # Notify main thread that data is fully ready
+            if self._ocr_gen != ocr_gen:
+                return
             self.msg_queue.put(("ocr_data_ready", len(boxes)))
 
         except Exception:
             import traceback
             traceback.print_exc()
-            self.msg_queue.put(("ocr_boxes_ready", []))
+            if self._ocr_gen == ocr_gen:
+                self.msg_queue.put(("ocr_boxes_ready", []))
 
     def display_translations(self, boxes):
         """Create per-box translucent overlay windows from OCR results."""
@@ -1347,7 +1363,14 @@ class ScreenFreezerApp:
             canvas.bind("<Shift-Button-3>", lambda e, i=idx: self._box_shift_right_click(e, i))
             canvas.bind("<Button-2>", lambda e, i=idx: self._box_middle_click(e, i))
 
-            # Escape on the box window itself
+            # Focus this box window so check_focus doesn't hide the overlay
+            if idx == 0:
+                try:
+                    win.focus_force()
+                except Exception:
+                    pass
+
+        # Escape on the box window itself
             win.bind("<Escape>", lambda e: self.unfreeze_screen())
             win.bind("<KeyPress-Control_L>", lambda e: self._on_ctrl_key(True))
             win.bind("<KeyPress-Control_R>", lambda e: self._on_ctrl_key(True))
@@ -2300,6 +2323,11 @@ class ScreenFreezerApp:
             return
         fg = user32.GetForegroundWindow()
         all_hwnds = {self._prev_focus_hwnd}
+        # Include the root tk window so focus tracking doesn't hide our overlays
+        try:
+            all_hwnds.add(user32.GetAncestor(self.root.winfo_id(), 2))
+        except Exception:
+            pass
         for win, _, _ in self._box_windows:
             try:
                 all_hwnds.add(user32.GetAncestor(win.winfo_id(), 2))
