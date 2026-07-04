@@ -134,6 +134,16 @@ def translate_deepl(text):
     resp.raise_for_status()
     return resp.json()["translations"][0]["text"]
 
+_deepl_cache = {}
+
+def _translate_or_cached(text):
+    """Return cached DeepL result or translate and cache it."""
+    if text in _deepl_cache:
+        return _deepl_cache[text]
+    result = translate_deepl(text)
+    _deepl_cache[text] = result
+    return result
+
 def translate_deepl_batch(texts):
     """Translate a batch of Japanese texts to English via a single DeepL API call."""
     if not texts:
@@ -556,7 +566,7 @@ def translate_and_convert(japanese_text, do_translate=True):
 
         if do_translate:
             if TRANSLATOR == "deepl":
-                english = translate_deepl(japanese_text)
+                english = _translate_or_cached(japanese_text)
             else:
                 english = GoogleTranslator(source='ja', target='en').translate(japanese_text)
         else:
@@ -774,6 +784,15 @@ class ScreenFreezerApp:
                     print(f"Processing: {proc_ms:.0f}ms")
                     if trans_ms:
                         print(f"Translation: {trans_ms:.0f}ms")
+                    ci = _process_japanese.cache_info()
+                    prev_hits = getattr(self, '_prev_cache_hits', 0)
+                    prev_misses = getattr(self, '_prev_cache_misses', 0)
+                    dh = ci.hits - prev_hits
+                    dm = ci.misses - prev_misses
+                    self._prev_cache_hits = ci.hits
+                    self._prev_cache_misses = ci.misses
+                    print(f"Cache: {dh} hits, {dm} misses, {ci.currsize} entries")
+                    print(f"DeepL cache: {len(_deepl_cache)} entries")
                     print(f"Total: {total:.0f}ms\n")
                     # Re-render card if currently showing (data was updated in-place)
                     if self._card_window and self._card_data_idx >= 0:
@@ -893,7 +912,7 @@ class ScreenFreezerApp:
                 if text and not box['data'].get('english'):
                     try:
                         if TRANSLATOR == "deepl":
-                            eng = translate_deepl(text)
+                            eng = _translate_or_cached(text)
                         else:
                             eng = GoogleTranslator(source='ja', target='en').translate(text)
                         box['data']['english'] = eng
@@ -1214,13 +1233,29 @@ class ScreenFreezerApp:
                         pass
             self._last_proc_ms = (time.time() - proc_start) * 1000
 
-            # Phase 2: batch translation API
+            # Phase 2: batch translation API (cached)
             if self.show_translation and translation_targets:
                 trans_start = time.time()
                 texts = [t[0] for t in translation_targets]
-                translations = translate_deepl_batch(texts)
+                # Batch-translate uncached texts, serve cached ones instantly
+                cached_set = _deepl_cache
+                translations = [None] * len(texts)
+                uncached_texts = []
+                uncached_indices = []
+                for i, t in enumerate(texts):
+                    if t in cached_set:
+                        translations[i] = cached_set[t]
+                    else:
+                        uncached_texts.append(t)
+                        uncached_indices.append(i)
+                if uncached_texts:
+                    batch_results = translate_deepl_batch(uncached_texts)
+                    for t, res in zip(uncached_texts, batch_results):
+                        cached_set[t] = res
+                    for idx, res in zip(uncached_indices, batch_results):
+                        translations[idx] = res
                 for i, trans in enumerate(translations):
-                    if i < len(boxes):
+                    if i < len(boxes) and trans is not None:
                         boxes[i]['data']['english'] = trans
                         h_extra = (len(trans) // 40) * 16
                         boxes[i]['h'] = boxes[i]['orig_bbox']['height'] + 130 + h_extra
