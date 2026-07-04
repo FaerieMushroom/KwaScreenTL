@@ -316,20 +316,157 @@ def _build_alternatives(orig, sudachi_hira):
                     if a is alts[0] or len(a['hira']) >= sudachi_len]
     if default not in alts:
         alts.insert(0, default)
-
     return alts
+
+
+# ── Number+counter reading correction ─────────────────────────────────────
+
+_COUNTER_READINGS = {
+    # (number_key, counter_char) → reading
+    # number_key: str of the number as it appears, '*' for general rule
+    '1人': 'ひとり', '2人': 'ふたり', '3人': 'さんにん', '4人': 'よにん', '5人': 'ごにん',
+    '6人': 'ろくにん', '7人': 'しちにん', '8人': 'はちにん', '9人': 'きゅうにん', '10人': 'じゅうにん',
+    '何人': 'なんにん',
+    '1日': 'ついたち', '2日': 'ふつか', '3日': 'みっか', '4日': 'よっか', '5日': 'いつか',
+    '6日': 'むいか', '7日': 'なのか', '8日': 'ようか', '9日': 'ここのか', '10日': 'とおか',
+    '14日': 'じゅうよっか', '20日': 'はつか', '24日': 'にじゅうよっか',
+    '1月': 'いちがつ', '2月': 'にがつ', '3月': 'さんがつ', '4月': 'しがつ', '5月': 'ごがつ',
+    '6月': 'ろくがつ', '7月': 'しちがつ', '8月': 'はちがつ', '9月': 'くがつ', '10月': 'じゅうがつ',
+    '11月': 'じゅういちがつ', '12月': 'じゅうにがつ',
+    '1個': 'いっこ', '2個': 'にこ', '3個': 'さんこ', '4個': 'よんこ', '5個': 'ごこ',
+    '6個': 'ろっこ', '7個': 'ななこ', '8個': 'はっこ', '9個': 'きゅうこ', '10個': 'じゅっこ',
+    '1匹': 'いっぴき', '2匹': 'にひき', '3匹': 'さんびき', '4匹': 'よんひき', '5匹': 'ごひき',
+    '6匹': 'ろっぴき', '7匹': 'ななひき', '8匹': 'はっぴき', '9匹': 'きゅうひき', '10匹': 'じゅっぴき',
+    '1本': 'いっぽん', '2本': 'にほん', '3本': 'さんぼん', '4本': 'よんほん', '5本': 'ごほん',
+    '6本': 'ろっぽん', '7本': 'ななほん', '8本': 'はっぽん', '9本': 'きゅうほん', '10本': 'じゅっぽん',
+    '1杯': 'いっぱい', '2杯': 'にはい', '3杯': 'さんばい', '4杯': 'よんはい', '5杯': 'ごはい',
+    '6杯': 'ろっぱい', '7杯': 'ななはい', '8杯': 'はっぱい', '9杯': 'きゅうはい', '10杯': 'じゅっぱい',
+    '1回': 'いっかい', '2回': 'にかい', '3回': 'さんかい', '4回': 'よんかい', '5回': 'ごかい',
+    '6回': 'ろっかい', '7回': 'ななかい', '8回': 'はっかい', '9回': 'きゅうかい', '10回': 'じゅっかい',
+    '1階': 'いっかい', '2階': 'にかい', '3階': 'さんがい', '4階': 'よんかい', '5階': 'ごかい',
+    '6階': 'ろっかい', '7階': 'ななかい', '8階': 'はっかい', '9階': 'きゅうかい', '10階': 'じゅっかい',
+    '1歳': 'いっさい', '2歳': 'にさい', '3歳': 'さんさい', '4歳': 'よんさい', '5歳': 'ごさい',
+    '6歳': 'ろくさい', '7歳': 'ななさい', '8歳': 'はっさい', '9歳': 'きゅうさい', '10歳': 'じゅっさい',
+}
+
+def _number_to_reading(num_str):
+    """Convert a numeric string to Japanese kana reading (e.g. '100' → 'ひゃく')."""
+    n = int(num_str)
+    if n == 0: return 'ゼロ'
+    if n == 1: return 'いち'
+    if n == 2: return 'に'
+    if n == 3: return 'さん'
+    if n == 4: return 'よん'
+    if n == 5: return 'ご'
+    if n == 6: return 'ろく'
+    if n == 7: return 'なな'
+    if n == 8: return 'はち'
+    if n == 9: return 'きゅう'
+    if n == 10: return 'じゅう'
+    if n == 100: return 'ひゃく'
+    if n == 1000: return 'せん'
+    if n == 10000: return 'いちまん'
+    if 11 <= n <= 99:
+        tens = n // 10
+        ones = n % 10
+        s = 'じゅう'
+        if tens > 1: s = _number_to_reading(str(tens)) + s
+        if ones: s += _number_to_reading(str(ones))
+        return s
+    if 101 <= n <= 999:
+        hundreds = n // 100
+        rest = n % 100
+        s = 'ひゃく' if hundreds == 1 else _number_to_reading(str(hundreds)) + 'ひゃく'
+        if rest: s += _number_to_reading(str(rest))
+        return s
+    if 1001 <= n <= 9999:
+        thousands = n // 1000
+        rest = n % 1000
+        s = 'せん' if thousands == 1 else _number_to_reading(str(thousands)) + 'せん'
+        if rest: s += _number_to_reading(str(rest))
+        return s
+    # 10000+ — simplified, just read as まん
+    man = n // 10000
+    rest = n % 10000
+    s = _number_to_reading(str(man)) + 'まん' if man else ''
+    if rest: s += _number_to_reading(str(rest))
+    return s
+
+def _fix_number_counter(tokens):
+    """Post-process Sudachi tokens: correct readings for numbers and number+counter combos.
+    Returns list of dicts with keys: surface, reading, hira, hepburn, dict_form."""
+    result = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        orig = token.surface()
+        if not orig.isdigit():
+            result.append({
+                'surface': orig,
+                'reading': token.reading_form(),
+                'hira': None,
+                'hepburn': None,
+                'dict_form': token.dictionary_form(),
+            })
+            i += 1
+            continue
+        # Digit-only token
+        next_is_counter = (i + 1 < len(tokens)
+                           and len(tokens[i + 1].surface()) == 1
+                           and _is_kanji(tokens[i + 1].surface()))
+        if next_is_counter:
+            next_token = tokens[i + 1]
+            next_orig = next_token.surface()
+            key = orig + next_orig
+            if key in _COUNTER_READINGS:
+                reading = _COUNTER_READINGS[key]
+                result.append({
+                    'surface': orig + next_orig,
+                    'reading': reading,
+                    'hira': reading,
+                    'hepburn': None,
+                    'dict_form': orig + next_orig,
+                })
+                i += 2
+                continue
+            # No special rule: combine number reading + counter's own reading
+            num_reading = _number_to_reading(orig)
+            counter_reading = jaconv.kata2hira(next_token.reading_form())
+            combined_reading = num_reading + counter_reading
+            result.append({
+                'surface': orig + next_orig,
+                'reading': combined_reading,
+                'hira': combined_reading,
+                'hepburn': None,
+                'dict_form': orig + next_orig,
+            })
+            i += 2
+            continue
+        # Standalone number
+        num_reading = _number_to_reading(orig)
+        result.append({
+            'surface': orig,
+            'reading': num_reading,
+            'hira': num_reading,
+            'hepburn': None,
+            'dict_form': orig,
+        })
+        i += 1
+    return result
+
 
 def translate_and_convert(japanese_text, do_translate=True):
     """Convert Japanese to Romaji, Hiragana, and English translation."""
     try:
         # Use SudachiPy (Mode C = longest natural chunks) for context-aware readings
         tokens = _get_sudachi().tokenize(japanese_text, SplitMode.C)
+        fixed = _fix_number_counter(tokens)
         items = []
-        for token in tokens:
-            orig = token.surface()
-            reading = token.reading_form()
-            dict_form = token.dictionary_form()
-            hira = jaconv.kata2hira(reading) if reading else orig
+        for ft in fixed:
+            orig = ft['surface']
+            reading = ft['reading']
+            hira = ft['hira'] or (jaconv.kata2hira(reading) if reading else orig)
+            dict_form = orig  # fallback, not used for non-number items below
             if any(_is_kanji(c) for c in orig):
                 alternatives = _build_alternatives(orig, hira)
                 items.append({
@@ -337,6 +474,18 @@ def translate_and_convert(japanese_text, do_translate=True):
                     'dict_form': dict_form,
                     'hira': alternatives[0]['hira'],
                     'hepburn': alternatives[0]['hepburn'],
+                    'alternatives': alternatives,
+                    'active_idx': 0,
+                })
+            elif orig.isdigit():
+                # Digit-only number: use the reading from _fix_number_counter
+                romaji = " ".join([r['hepburn'] for r in kks.convert(hira)])
+                alternatives = [{'hira': hira, 'hepburn': romaji, 'type': 'number'}]
+                items.append({
+                    'orig': orig,
+                    'dict_form': dict_form,
+                    'hira': hira,
+                    'hepburn': romaji,
                     'alternatives': alternatives,
                     'active_idx': 0,
                 })
@@ -968,7 +1117,7 @@ class ScreenFreezerApp:
                 text = re.sub(r'\s+', '', text)
                 if not text:
                     continue
-                if self.skip_non_japanese and not contains_japanese(text):
+                if self.skip_non_japanese and not contains_japanese(text) and not text.isdigit():
                     continue
                 translation_targets.append((text, bbox, crop_pil, words_data))
 
