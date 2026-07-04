@@ -1,23 +1,31 @@
 @echo off
 setlocal
 set VENV_DIR=C:\GitRepos\KwaScreenTL\.venv
+set PYTHON=%VENV_DIR%\Scripts\python
 
 echo Creating virtual environment...
 python -m venv "%VENV_DIR%"
 
 echo Installing dependencies...
-"%VENV_DIR%\Scripts\pip" install --upgrade pip >nul
-"%VENV_DIR%\Scripts\pip" install -r requirements.txt
-"%VENV_DIR%\Scripts\pip" install paddleocr
+%PYTHON% -m pip install --upgrade pip >nul
+%PYTHON% -m pip install -r requirements.txt
+%PYTHON% -m pip install paddleocr
+
+echo Attempting optional GPU acceleration (onnxruntime-gpu)...
+%PYTHON% -m pip install onnxruntime-gpu 2>nul && (
+    echo GPU acceleration enabled.
+) || (
+    echo GPU acceleration not available ^(no CUDA/compatible GPU found^), using CPU.
+)
 
 echo Downloading Jamdict database (~120MB, first launch only)...
-"%VENV_DIR%\Scripts\python" -c "from jamdict import Jamdict; Jamdict(); print('Jamdict ready.')"
+%PYTHON% -c "from jamdict import Jamdict; Jamdict(); print('Jamdict ready.')"
 
 echo.
 echo ============================================
 echo Setup complete!
 echo.
 echo To run the app, use:
-echo   %VENV_DIR%\Scripts\python main.py
+echo   %PYTHON% main.py
 echo ============================================
 pause

@@ -1,6 +1,5 @@
 mss
 pillow
-winocr
 pykakasi
 sudachipy
 sudachidict_core
@@ -9,5 +8,4 @@ jamdict
 deep-translator
 edge-tts
 paddleocr
-paddlepaddle
 onnxruntime

@@ -70,6 +70,7 @@ from jamdict import Jamdict
 from sudachipy import Dictionary, SplitMode
 from deep_translator import GoogleTranslator
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import webbrowser
 import urllib.parse
 
@@ -98,6 +99,17 @@ def get_paddle_ocr():
         from paddleocr import PaddleOCR
         logging.getLogger("ppocr").setLevel(logging.WARNING)
         logging.getLogger("paddlex").setLevel(logging.WARNING)
+        try:
+            import onnxruntime
+            providers = onnxruntime.get_available_providers()
+            if 'CUDAExecutionProvider' in providers:
+                print("GPU acceleration enabled (CUDA)")
+            elif 'TensorrtExecutionProvider' in providers:
+                print("GPU acceleration enabled (TensorRT)")
+            else:
+                print("GPU acceleration not available, using CPU")
+        except Exception:
+            print("GPU acceleration not available, using CPU")
         _paddle_ocr = PaddleOCR(
             lang='japan', engine='onnxruntime',
             use_doc_orientation_classify=False,
@@ -105,7 +117,6 @@ def get_paddle_ocr():
             use_textline_orientation=False,
             return_word_box=True,
         )
-        pass
     return _paddle_ocr
 
 def translate_deepl(text):
@@ -122,6 +133,24 @@ def translate_deepl(text):
         return "[DeepL: Unauthorized - check your API key]"
     resp.raise_for_status()
     return resp.json()["translations"][0]["text"]
+
+def translate_deepl_batch(texts):
+    """Translate a batch of Japanese texts to English via a single DeepL API call."""
+    if not texts:
+        return []
+    import requests
+    key = get_deepl_api_key()
+    if not key:
+        return ["[DeepL: no API key - add to deeplapikey.txt]"] * len(texts)
+    resp = requests.post(
+        "https://api-free.deepl.com/v2/translate",
+        headers={"Authorization": f"DeepL-Auth-Key {key}"},
+        json={"text": texts, "source_lang": "JA", "target_lang": "EN"}
+    )
+    if resp.status_code == 403:
+        return ["[DeepL: Unauthorized - check your API key]"] * len(texts)
+    resp.raise_for_status()
+    return [t["text"] for t in resp.json()["translations"]]
 
 # Win32 constants for click-through overlay
 WS_EX_LAYERED = 0x80000
@@ -455,79 +484,76 @@ def _fix_number_counter(tokens):
     return result
 
 
+@lru_cache(maxsize=2048)
+def _process_japanese(text):
+    """Local processing: tokenize, convert to romaji/kana. Pure function (cached)."""
+    try:
+        tokens = _get_sudachi().tokenize(text, SplitMode.C)
+    except Exception:
+        return (text, '[Error]', text, ())
+
+    fixed = _fix_number_counter(tokens)
+    items = []  # list of (orig, dict_form, hira, hepburn, alternatives, active_idx, no_trail_space)
+    for ft in fixed:
+        orig = ft['surface']
+        reading = ft['reading']
+        hira = ft['hira'] or (jaconv.kata2hira(reading) if reading else orig)
+        dict_form = orig
+        if any(_is_kanji(c) for c in orig):
+            alternatives = _build_alternatives(orig, hira)
+            items.append((orig, dict_form, alternatives[0]['hira'],
+                          alternatives[0]['hepburn'], alternatives, 0, False))
+        elif orig.isdigit():
+            romaji = " ".join([r['hepburn'] for r in kks.convert(hira)])
+            alternatives = ((hira, romaji, 'number'),)
+            items.append((orig, dict_form, hira, romaji, alternatives, 0, False))
+        elif not any(_is_kana(c) for c in orig):
+            alternatives = ((orig, orig, 'unknown'),)
+            items.append((orig, dict_form, orig, orig, alternatives, 0, False))
+        else:
+            alternatives = _build_alternatives(orig, hira)
+            items.append((orig, dict_form, alternatives[0]['hira'],
+                          alternatives[0]['hepburn'], alternatives, 0, False))
+
+    for i in range(len(items) - 1):
+        h1 = items[i][3]
+        h2 = items[i+1][3]
+        if h1.endswith('tsu') and h2 and h2[0] in 'bcdfghjklmnpqrstvwxyz':
+            items[i] = items[i][:3] + (h1[:-3],) + items[i][4:6] + (True,)
+            items[i+1] = items[i+1][:3] + (h2[0] + h2,) + items[i+1][4:]
+
+    romaji_parts = []
+    for i, item in enumerate(items):
+        h = item[3] or item[0]
+        if i > 0 and not items[i-1][6]:
+            romaji_parts.append(' ')
+        romaji_parts.append(h)
+    romaji = ''.join(romaji_parts)
+    kana = " ".join([item[2] if item[2] else item[0] for item in items])
+
+    return (text, romaji, kana, tuple(items))
+
+
+def _unpack_items(items_tuple):
+    """Convert cached tuple representation back to list-of-dicts format."""
+    result = []
+    for item in items_tuple:
+        orig, df, hira, hep, alts, active, _ = item
+        if isinstance(alts, tuple) and len(alts) > 0 and isinstance(alts[0], tuple):
+            alts = [{'hira': a[0], 'hepburn': a[1], 'type': a[2]} for a in alts]
+        result.append({
+            'orig': orig, 'dict_form': df, 'hira': hira,
+            'hepburn': hep, 'alternatives': alts, 'active_idx': active,
+        })
+    return result
+
+
 def translate_and_convert(japanese_text, do_translate=True):
     """Convert Japanese to Romaji, Hiragana, and English translation."""
     try:
-        # Use SudachiPy (Mode C = longest natural chunks) for context-aware readings
-        tokens = _get_sudachi().tokenize(japanese_text, SplitMode.C)
-        fixed = _fix_number_counter(tokens)
-        items = []
-        for ft in fixed:
-            orig = ft['surface']
-            reading = ft['reading']
-            hira = ft['hira'] or (jaconv.kata2hira(reading) if reading else orig)
-            dict_form = orig  # fallback, not used for non-number items below
-            if any(_is_kanji(c) for c in orig):
-                alternatives = _build_alternatives(orig, hira)
-                items.append({
-                    'orig': orig,
-                    'dict_form': dict_form,
-                    'hira': alternatives[0]['hira'],
-                    'hepburn': alternatives[0]['hepburn'],
-                    'alternatives': alternatives,
-                    'active_idx': 0,
-                })
-            elif orig.isdigit():
-                # Digit-only number: use the reading from _fix_number_counter
-                romaji = " ".join([r['hepburn'] for r in kks.convert(hira)])
-                alternatives = [{'hira': hira, 'hepburn': romaji, 'type': 'number'}]
-                items.append({
-                    'orig': orig,
-                    'dict_form': dict_form,
-                    'hira': hira,
-                    'hepburn': romaji,
-                    'alternatives': alternatives,
-                    'active_idx': 0,
-                })
-            elif not any(_is_kana(c) for c in orig):
-                # Pure symbols/punctuation (no kana): show original character
-                items.append({
-                    'orig': orig,
-                    'dict_form': dict_form,
-                    'hira': orig,
-                    'hepburn': orig,
-                    'alternatives': [{'hira': orig, 'hepburn': orig, 'type': 'unknown'}],
-                    'active_idx': 0,
-                })
-            else:
-                # Kana-only tokens: convert to romaji normally
-                alternatives = _build_alternatives(orig, hira)
-                items.append({
-                    'orig': orig,
-                    'dict_form': dict_form,
-                    'hira': alternatives[0]['hira'],
-                    'hepburn': alternatives[0]['hepburn'],
-                    'alternatives': alternatives,
-                    'active_idx': 0,
-                })
-        # Fix sokuon gemination across token boundaries (入っ+てる→haitteru)
-        for i in range(len(items) - 1):
-            h1 = items[i].get('hepburn', '')
-            h2 = items[i+1].get('hepburn', '')
-            if h1.endswith('tsu') and h2 and h2[0] in 'bcdfghjklmnpqrstvwxyz':
-                items[i]['hepburn'] = h1[:-3]
-                items[i+1]['hepburn'] = h2[0] + h2
-                items[i]['_no_trail_space'] = True
-        romaji_parts = []
-        for i, item in enumerate(items):
-            h = item.get('hepburn', '') or item['orig']
-            if i > 0 and not items[i-1].get('_no_trail_space'):
-                romaji_parts.append(' ')
-            romaji_parts.append(h)
-        romaji = ''.join(romaji_parts)
-        kana = " ".join([item['hira'] if item['hira'] else item['orig'] for item in items])
-        
-        # Translate to English
+        text, romaji, kana, items_tuple = _process_japanese(japanese_text)
+        items = _unpack_items(items_tuple)
+
         if do_translate:
             if TRANSLATOR == "deepl":
                 english = translate_deepl(japanese_text)
@@ -542,7 +568,7 @@ def translate_and_convert(japanese_text, do_translate=True):
         kana = japanese_text
         english = f"Translation error: {e}"
         items = []
-        
+
     return {
         'original': japanese_text,
         'romaji': romaji,
@@ -729,6 +755,29 @@ class ScreenFreezerApp:
                     self.enter_snip_mode()
                 elif msg_type == "ocr_complete":
                     self.display_translations(data)
+                elif msg_type == "ocr_boxes_ready":
+                    # Dismiss loading overlay on first box arrival
+                    if self._loading_win:
+                        try:
+                            self._loading_win.destroy()
+                        except Exception:
+                            pass
+                        self._loading_win = None
+                        self._load_tk_img = None
+                    self.display_translations(data)
+                elif msg_type == "ocr_data_ready":
+                    total = (time.time() - self._ocr_start_time) * 1000
+                    ocr_ms = getattr(self, '_last_ocr_ms', 0)
+                    proc_ms = getattr(self, '_last_proc_ms', 0)
+                    trans_ms = getattr(self, '_last_translation_ms', 0)
+                    print(f"OCR: {data} regions, {ocr_ms:.0f}ms")
+                    print(f"Processing: {proc_ms:.0f}ms")
+                    if trans_ms:
+                        print(f"Translation: {trans_ms:.0f}ms")
+                    print(f"Total: {total:.0f}ms\n")
+                    # Re-render card if currently showing (data was updated in-place)
+                    if self._card_window and self._card_data_idx >= 0:
+                        self._render_card()
                 elif msg_type == "toggle_settings":
                     self.toggle_settings()
         except queue.Empty:
@@ -1092,11 +1141,15 @@ class ScreenFreezerApp:
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
         
         try:
+            # Phase 0: OCR
             ocr_start = time.time()
             lines = self.run_ocr_paddle(win_crop)
             ocr_time = (time.time() - ocr_start) * 1000
-            
+            self._last_ocr_ms = ocr_time
+
+            # Build translation targets and initial placeholder boxes
             translation_targets = []
+            boxes = []
             for line in lines:
                 text = line.get('text', '').strip()
                 bbox = get_line_bounding_rect(line)
@@ -1108,91 +1161,80 @@ class ScreenFreezerApp:
                     if wt:
                         words_data.append({
                             'text': wt,
-                            'x': br['x'],
-                            'y': br['y'],
-                            'width': br['width'],
-                            'height': br['height']
+                            'x': br['x'], 'y': br['y'],
+                            'width': br['width'], 'height': br['height'],
                         })
 
-                crop_pil = None
                 text = text.strip()
                 text = re.sub(r'\s+', '', text)
                 if not text:
                     continue
                 if self.skip_non_japanese and not contains_japanese(text) and not text.isdigit():
                     continue
-                translation_targets.append((text, bbox, crop_pil, words_data))
+                translation_targets.append((text, bbox, words_data))
 
-            # Phase 1: local processing (parallel)
+                # Crop image for the overlay window background
+                box_crop = pil_img.crop((
+                    max(0, int(bbox['x'] + win_x)),
+                    max(0, int(bbox['y'] + win_y)),
+                    min(pil_img.width,  int(bbox['x'] + bbox['width'] + win_x)),
+                    min(pil_img.height, int(bbox['y'] + bbox['height'] + win_y))
+                ))
+
+                # Placeholder data for immediate display
+                w = min(max(len(text) * 7 + 24, bbox['width'] + 24, 180), 400)
+                h = bbox['height'] + 130
+                boxes.append({
+                    'w': w, 'h': h,
+                    'data': {'original': text, 'romaji': '', 'kana': '', 'english': '', 'kakasi_items': []},
+                    'orig_bbox': bbox, 'crop_pil': box_crop, 'words': words_data,
+                })
+
+            # Send boxes to main thread immediately (progressive rendering)
+            self.msg_queue.put(("ocr_boxes_ready", boxes))
+
+            # Phase 1: local processing (parallel, cached)
             proc_start = time.time()
-            proc_results = []
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {
-                    executor.submit(translate_and_convert, text, False): (text, bbox, crop_pil, words_data)
-                    for text, bbox, crop_pil, words_data in translation_targets
+                    executor.submit(_process_japanese, text): i
+                    for i, (text, _, _) in enumerate(translation_targets)
                 }
                 for future in futures:
-                    text, bbox, crop_pil, words_data = futures[future]
+                    i = futures[future]
                     try:
-                        res = future.result()
-                        proc_results.append({
-                            'res': res, 'text': text, 'bbox': bbox,
-                            'crop_pil': crop_pil, 'words_data': words_data,
-                        })
+                        text, romaji, kana, items_tuple = future.result()
+                        items = _unpack_items(items_tuple)
+                        boxes[i]['data'].update({'romaji': romaji, 'kana': kana, 'kakasi_items': items})
+                        # Re-estimate box size based on real content
+                        max_chars = max(len(text), len(romaji), len(kana))
+                        text_w = max_chars * 7 + 24
+                        boxes[i]['w'] = min(max(text_w, boxes[i]['orig_bbox']['width'] + 24, 180), 400)
                     except Exception:
                         pass
             self._last_proc_ms = (time.time() - proc_start) * 1000
 
-            # Phase 2: translation API (parallel, only if enabled)
-            if self.show_translation:
+            # Phase 2: batch translation API
+            if self.show_translation and translation_targets:
                 trans_start = time.time()
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = {
-                        executor.submit(translate_deepl, pr['text']): pr
-                        for pr in proc_results
-                    }
-                    for future in futures:
-                        try:
-                            futures[future]['res']['english'] = future.result()
-                        except Exception:
-                            futures[future]['res']['english'] = ''
+                texts = [t[0] for t in translation_targets]
+                translations = translate_deepl_batch(texts)
+                for i, trans in enumerate(translations):
+                    if i < len(boxes):
+                        boxes[i]['data']['english'] = trans
+                        h_extra = (len(trans) // 40) * 16
+                        boxes[i]['h'] = boxes[i]['orig_bbox']['height'] + 130 + h_extra
                 self._last_translation_ms = (time.time() - trans_start) * 1000
             else:
                 self._last_translation_ms = 0
 
-            # Phase 3: build boxes
-            boxes = []
-            for pr in proc_results:
-                res = pr['res']
-                bbox = pr['bbox']
-                crop_pil = pr['crop_pil']
-                words_data = pr['words_data']
-                try:
-                    if crop_pil is None:
-                        crop_pil = pil_img.crop((
-                            max(0, int(bbox['x'] + win_x)),
-                            max(0, int(bbox['y'] + win_y)),
-                            min(pil_img.width,  int(bbox['x'] + bbox['width'] + win_x)),
-                            min(pil_img.height, int(bbox['y'] + bbox['height'] + win_y))
-                        ))
-                    max_chars = max(len(res['original']), len(res['romaji']), len(res['kana']), len(res['english']))
-                    text_w = max_chars * 7 + 24
-                    w = min(max(text_w, bbox['width'] + 24, 180), 400)
-                    h = bbox['height'] + 130 + (len(res['english']) // 40) * 16
-                    boxes.append({
-                        'w': w, 'h': h, 'data': res,
-                        'orig_bbox': bbox, 'crop_pil': crop_pil, 'words': words_data,
-                    })
-                except Exception:
-                    pass
+            # Notify main thread that data is fully ready
+            self.msg_queue.put(("ocr_data_ready", len(boxes)))
 
-            self._last_ocr_ms = ocr_time
-
-            # Post result back to main GUI thread
-            self.msg_queue.put(("ocr_complete", boxes))
         except Exception:
-            pass
-            self.msg_queue.put(("ocr_complete", []))
+            import traceback
+            traceback.print_exc()
+            self.msg_queue.put(("ocr_boxes_ready", []))
 
     def display_translations(self, boxes):
         """Create per-box translucent overlay windows from OCR results."""
@@ -1275,16 +1317,6 @@ class ScreenFreezerApp:
             win.bind("<KeyRelease-Control_R>", lambda e: self._on_ctrl_key(False))
 
             self._box_windows.append((win, canvas, idx))
-
-        total = (time.time() - self._ocr_start_time) * 1000
-        ocr_ms = getattr(self, '_last_ocr_ms', 0)
-        proc_ms = getattr(self, '_last_proc_ms', 0)
-        trans_ms = getattr(self, '_last_translation_ms', 0)
-        print(f"OCR: {len(boxes)} regions, {ocr_ms:.0f}ms")
-        print(f"Processing: {proc_ms:.0f}ms")
-        if trans_ms:
-            print(f"Translation: {trans_ms:.0f}ms")
-        print(f"Total: {total:.0f}ms\n")
 
     def _destroy_box_windows(self):
         """Destroy all box windows and hide card."""
