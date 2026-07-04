@@ -115,7 +115,9 @@ def get_paddle_ocr():
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            return_word_box=True,
+            return_word_box=False,
+            det_db_thresh=0.4,
+            det_db_box_thresh=0.6,
         )
     return _paddle_ocr
 
@@ -1108,7 +1110,7 @@ class ScreenFreezerApp:
         """Run PaddleOCR on the crop, return lines with per-char bounding boxes."""
         ocr = get_paddle_ocr()
         import numpy as np
-        img_array = np.array(win_crop.convert("RGB"))
+        img_array = np.array(win_crop)
         results = list(ocr.predict(img_array))
         lines = []
         if results:
