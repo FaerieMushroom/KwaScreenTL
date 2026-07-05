@@ -138,11 +138,16 @@ def translate_deepl(text):
     return resp.json()["translations"][0]["text"]
 
 _deepl_cache = {}
+_deepl_hits = 0
+_deepl_misses = 0
 
 def _translate_or_cached(text):
     """Return cached DeepL result or translate and cache it."""
+    global _deepl_hits, _deepl_misses
     if text in _deepl_cache:
+        _deepl_hits += 1
         return _deepl_cache[text]
+    _deepl_misses += 1
     result = translate_deepl(text)
     _deepl_cache[text] = result
     return result
@@ -650,6 +655,7 @@ class ScreenFreezerApp:
         self.show_romaji = True
         self.skip_non_japanese = SKIP_NON_JAPANESE
         self.show_translation = True
+        self.region_detect_scale = 100
         self.japanese_font = "Meiryo"
         self.japanese_font_size = 16
         self.font_size_en = 10
@@ -764,7 +770,11 @@ class ScreenFreezerApp:
                     if self.active:
                         self.unfreeze_screen()
                     else:
-                        self.freeze_screen()
+                        try:
+                            self.freeze_screen()
+                        except Exception:
+                            import traceback
+                            traceback.print_exc(file=sys.stdout)
                 elif msg_type == "trigger_snip":
                     self.enter_snip_mode()
                 elif msg_type == "ocr_complete":
@@ -784,7 +794,9 @@ class ScreenFreezerApp:
                     ocr_ms = getattr(self, '_last_ocr_ms', 0)
                     proc_ms = getattr(self, '_last_proc_ms', 0)
                     trans_ms = getattr(self, '_last_translation_ms', 0)
-                    print(f"OCR: {data} regions, {ocr_ms:.0f}ms")
+                    cw, ch = getattr(self, '_last_crop_size', (0, 0))
+                    dims = f"({cw}x{ch})" if cw else ""
+                    print(f"OCR: {data} regions, {ocr_ms:.0f}ms {dims}")
                     print(f"Processing: {proc_ms:.0f}ms")
                     if trans_ms:
                         print(f"Translation: {trans_ms:.0f}ms")
@@ -796,7 +808,11 @@ class ScreenFreezerApp:
                     self._prev_cache_hits = ci.hits
                     self._prev_cache_misses = ci.misses
                     print(f"Cache: {dh} hits, {dm} misses, {ci.currsize} entries")
-                    print(f"DeepL cache: {len(_deepl_cache)} entries")
+                    dh2 = _deepl_hits - getattr(self, '_prev_deepl_hits', 0)
+                    dm2 = _deepl_misses - getattr(self, '_prev_deepl_misses', 0)
+                    self._prev_deepl_hits = _deepl_hits
+                    self._prev_deepl_misses = _deepl_misses
+                    print(f"DeepL cache: {dh2} hits, {dm2} misses, {len(_deepl_cache)} entries")
                     print(f"Total: {total:.0f}ms\n")
                     # Re-render card if currently showing (data was updated in-place)
                     if self._card_window and self._card_data_idx >= 0:
@@ -805,6 +821,9 @@ class ScreenFreezerApp:
                     self.toggle_settings()
         except queue.Empty:
             pass
+        except Exception:
+            import traceback
+            traceback.print_exc(file=sys.stdout)
         self._poll_ctrl_state()
         self.root.after(50, self.check_queue)
 
@@ -825,6 +844,7 @@ class ScreenFreezerApp:
             self.show_romaji = data.get("show_romaji", True)
             self.skip_non_japanese = data.get("skip_non_japanese", SKIP_NON_JAPANESE)
             self.show_translation = data.get("show_translation", True)
+            self.region_detect_scale = data.get("region_detect_scale", 100)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
@@ -834,6 +854,7 @@ class ScreenFreezerApp:
             "show_romaji": self.show_romaji,
             "skip_non_japanese": self.skip_non_japanese,
             "show_translation": self.show_translation,
+            "region_detect_scale": self.region_detect_scale,
         }
         with open(self._settings_file, "w") as f:
             json.dump(data, f)
@@ -888,10 +909,32 @@ class ScreenFreezerApp:
         tk.Checkbutton(win, text="Skip non-Japanese text", variable=self._skip_nj_var,
                        command=on_toggle).pack(anchor="w", **pad)
 
-        tk.Label(win, text="Debug", font=("Segoe UI", 9, "bold"),
+        tk.Label(win, text="OCR Scaling", font=("Segoe UI", 9, "bold"),
                  anchor="w").pack(fill="x", padx=12, pady=(10, 2))
         sep3 = tk.Frame(win, height=1, bg="#c0c0c0")
         sep3.pack(fill="x", padx=12)
+
+        opts = {"25%": 25, "50%": 50, "75%": 75, "100%": 100}
+        def opt_label(v): return next(k for k, val in opts.items() if val == v)
+
+        self._region_detect_var = tk.StringVar(value=opt_label(self.region_detect_scale))
+
+        def on_scale_change(*_):
+            val = opts[self._region_detect_var.get()]
+            self.region_detect_scale = val
+            self._save_settings()
+
+        self._region_detect_var.trace_add("write", on_scale_change)
+
+        f1 = tk.Frame(win)
+        f1.pack(fill="x", padx=12, pady=3)
+        tk.Label(f1, text="OCR Prepass Scale:", anchor="w", width=20).pack(side="left")
+        tk.OptionMenu(f1, self._region_detect_var, *opts.keys()).pack(side="left")
+
+        tk.Label(win, text="Debug", font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        sep4 = tk.Frame(win, height=1, bg="#c0c0c0")
+        sep4.pack(fill="x", padx=12)
         tk.Checkbutton(win, text="Show cropped image", variable=self._show_crop_var,
                        command=on_toggle).pack(anchor="w", **pad)
 
@@ -998,7 +1041,7 @@ class ScreenFreezerApp:
         self._ocr_gen += 1
         threading.Thread(
             target=self.process_ocr,
-            args=(self.pil_img, win_local, self._ocr_gen),
+            args=(self.pil_img, win_local, self._ocr_gen, None),
             daemon=True
         ).start()
 
@@ -1118,60 +1161,74 @@ class ScreenFreezerApp:
         ).start()
 
     def run_ocr_paddle(self, win_crop):
-        """Run PaddleOCR on the crop, return lines with per-char bounding boxes."""
+        """Run PaddleOCR on the crop, return lines with per-char bounding boxes.
+        Optionally pre-detects at a smaller scale to speed up region finding."""
         ocr = get_paddle_ocr()
         import numpy as np
         img_array = np.array(win_crop)
-        results = list(ocr.predict(img_array))
-        lines = []
-        if results:
-            r = results[0]
-            dt_polys = r.get('dt_polys', [])
-            rec_texts = r.get('rec_texts', [])
-            for poly, text in zip(dt_polys, rec_texts):
-                text = re.sub(r'\s+', '', text).strip()
-                if not text:
-                    continue
-                xs = [int(p[0]) for p in poly]
-                ys = [int(p[1]) for p in poly]
-                line_bbox = {
-                    'x': min(xs),
-                    'y': min(ys),
-                    'width': max(xs) - min(xs),
-                    'height': max(ys) - min(ys)
-                }
-                chars = list(text)
-                words = []
-                weights = [1.0 for ch in chars]
-                if weights and chars[-1] in '。、！）」』】〙〛〕\u3001\u3002\uff01\uff09':
-                    weights[-1] = 0.3
-                total_w = sum(weights)
-                accum = 0.0
-                for ci, ch in enumerate(chars):
-                    cw = weights[ci] / total_w * line_bbox['width']
-                    x0 = line_bbox['x'] + int(accum)
-                    accum += cw
-                    x1 = line_bbox['x'] + int(accum)
-                    words.append({
-                        'text': ch,
-                        'bounding_rect': {
-                            'x': x0,
-                            'y': line_bbox['y'],
-                            'width': x1 - x0,
-                            'height': line_bbox['height'],
-                        }
-                    })
-                lines.append({
-                    'text': text,
-                    'words': words,
-                })
+        inner = ocr.paddlex_pipeline._pipeline
+
+        ds = getattr(self, 'region_detect_scale', 100)
+        use_pre = ds > 0
+        oh, ow = img_array.shape[:2]
+
+        if use_pre:
+            # Pre-detect at reduced scale → full-res recognition
+            ratio = 100.0 / ds
+            dw = int(ow * ds / 100)
+            dh = int(oh * ds / 100)
+            det_img = np.array(Image.fromarray(img_array).resize((dw, dh), Image.LANCZOS))
+            det_gen = inner.text_det_model(det_img)
+            det_items = list(det_gen)
+            lines = []
+            if det_items:
+                r = det_items[0]
+                dt_polys = np.asarray(r.get('dt_polys', []), dtype=np.float64)
+                if dt_polys.ndim == 3 and dt_polys.shape[1:] == (4, 2):
+                    for poly in dt_polys:
+                        xs = [p[0] * ratio for p in poly]
+                        ys = [p[1] * ratio for p in poly]
+                        x1 = max(0, int(min(xs)))
+                        y1 = max(0, int(min(ys)))
+                        x2 = min(ow, int(max(xs)))
+                        y2 = min(oh, int(max(ys)))
+                        if x2 - x1 < 8 or y2 - y1 < 8:
+                            continue
+                        crop = img_array[y1:y2, x1:x2]
+                        rec_gen = inner.text_rec_model(crop)
+                        rec_items = list(rec_gen)
+                        text = ''
+                        if rec_items and hasattr(rec_items[0], 'get'):
+                            text = rec_items[0].get('rec_text', '')
+                        text = re.sub(r'\s+', '', text).strip()
+                        if not text:
+                            continue
+                        line_bbox = {'x': x1, 'y': y1, 'width': x2 - x1, 'height': y2 - y1}
+                        chars = list(text)
+                        wt = [1.0 for _ in chars]
+                        if wt and chars[-1] in '。、！）」』】〙〛〕\u3001\u3002\uff01\uff09':
+                            wt[-1] = 0.3
+                        total_w = sum(wt)
+                        accum = 0.0
+                        words = []
+                        for ch, cw in zip(chars, wt):
+                            cw = cw / total_w * line_bbox['width']
+                            x0 = line_bbox['x'] + int(accum)
+                            accum += cw
+                            x1w = line_bbox['x'] + int(accum)
+                            words.append({'text': ch, 'bounding_rect': {'x': x0, 'y': line_bbox['y'], 'width': x1w - x0, 'height': line_bbox['height']}})
+                        lines.append({'text': text, 'words': words})
         return lines
 
-    def process_ocr(self, pil_img, win_local, ocr_gen):
+    def process_ocr(self, pil_img, win_local, ocr_gen, detect_scale=None):
         """Run OCR on the focused window crop only, then offset boxes to screen coords.
         `ocr_gen` is a generation counter used to discard stale results if a new scan starts."""
         win_x, win_y = win_local['x'], win_local['y']
         win_crop = pil_img.crop((win_x, win_y, win_x + win_local['w'], win_y + win_local['h']))
+        
+        saved = self.region_detect_scale
+        if detect_scale is not None:
+            self.region_detect_scale = detect_scale
         
         try:
             # Phase 0: OCR
@@ -1179,6 +1236,7 @@ class ScreenFreezerApp:
             lines = self.run_ocr_paddle(win_crop)
             ocr_time = (time.time() - ocr_start) * 1000
             self._last_ocr_ms = ocr_time
+            self._last_crop_size = (win_crop.width, win_crop.height)
 
             # Build translation targets and initial placeholder boxes
             translation_targets = []
@@ -1254,14 +1312,17 @@ class ScreenFreezerApp:
                 trans_start = time.time()
                 texts = [t[0] for t in translation_targets]
                 # Batch-translate uncached texts, serve cached ones instantly
+                global _deepl_hits, _deepl_misses
                 cached_set = _deepl_cache
                 translations = [None] * len(texts)
                 uncached_texts = []
                 uncached_indices = []
                 for i, t in enumerate(texts):
                     if t in cached_set:
+                        _deepl_hits += 1
                         translations[i] = cached_set[t]
                     else:
+                        _deepl_misses += 1
                         uncached_texts.append(t)
                         uncached_indices.append(i)
                 if uncached_texts:
@@ -1287,8 +1348,11 @@ class ScreenFreezerApp:
         except Exception:
             import traceback
             traceback.print_exc()
+            traceback.print_exc(file=sys.stdout)
             if self._ocr_gen == ocr_gen:
                 self.msg_queue.put(("ocr_boxes_ready", []))
+        finally:
+            self.region_detect_scale = saved
 
     def display_translations(self, boxes):
         """Create per-box translucent overlay windows from OCR results."""
