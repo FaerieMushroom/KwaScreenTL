@@ -447,9 +447,30 @@ _SUDACHI_POS = {
     '接頭辞': 'prefix', '接尾辞': 'suffix',
 }
 
+_SUDACHI_CONJ_LABEL = {
+    '終止形-一般': '',
+    '連体形-一般': 'attributive',
+    '連用形-一般': 'ます-stem',
+    '連用形-促音便': 'て-form',
+    '連用形-撥音便': 'んで-form',
+    '連用形-イ音便': 'て-form (i)',
+    '未然形-一般': 'causative/passive',
+    '未然形-ウ接続': 'volitional',
+    '意志推量形': 'volitional',
+    '仮定形-一般': 'conditional (-ば)',
+    '命令形-一般': 'imperative',
+    '已然形-一般': 'conditional (archaic)',
+}
+
+def _extract_conj_label(pos):
+    """Extract conjugation label from Sudachi POS tuple (index 5)."""
+    if pos and len(pos) > 5 and pos[5] and pos[5] != '*':
+        return _SUDACHI_CONJ_LABEL.get(pos[5], pos[5])
+    return ''
+
 def _fix_number_counter(tokens):
     """Post-process Sudachi tokens: correct readings for numbers and number+counter combos.
-    Returns list of dicts with keys: surface, reading, hira, hepburn, dict_form, pos."""
+    Returns list of dicts with keys: surface, reading, hira, hepburn, dict_form, pos, conj."""
     result = []
     i = 0
     while i < len(tokens):
@@ -464,6 +485,7 @@ def _fix_number_counter(tokens):
                 'hepburn': None,
                 'dict_form': token.dictionary_form(),
                 'pos': _SUDACHI_POS.get(pos[0] if pos else '', ''),
+                'conj': _extract_conj_label(pos),
             })
             i += 1
             continue
@@ -483,7 +505,7 @@ def _fix_number_counter(tokens):
                     'hira': reading,
                     'hepburn': None,
                     'dict_form': orig + next_orig,
-                    'pos': '',
+                    'pos': '', 'conj': '',
                 })
                 i += 2
                 continue
@@ -497,7 +519,7 @@ def _fix_number_counter(tokens):
                 'hira': combined_reading,
                 'hepburn': None,
                 'dict_form': orig + next_orig,
-                'pos': '',
+                'pos': '', 'conj': '',
             })
             i += 2
             continue
@@ -509,7 +531,7 @@ def _fix_number_counter(tokens):
             'hira': num_reading,
             'hepburn': None,
             'dict_form': orig,
-            'pos': '',
+            'pos': '', 'conj': '',
         })
         i += 1
     return result
@@ -524,34 +546,35 @@ def _process_japanese(text):
         return (text, '[Error]', text, ())
 
     fixed = _fix_number_counter(tokens)
-    items = []  # list of (orig, dict_form, hira, hepburn, alternatives, active_idx, no_trail_space, pos)
+    items = []  # list of (orig, dict_form, hira, hepburn, alternatives, active_idx, no_trail_space, pos, conj)
     for ft in fixed:
         orig = ft['surface']
         reading = ft['reading']
         hira = ft['hira'] or (jaconv.kata2hira(reading) if reading else orig)
-        dict_form = orig
+        dict_form = ft.get('dict_form') or orig
         pos = ft.get('pos', '')
+        conj = ft.get('conj', '')
         if any(_is_kanji(c) for c in orig):
             alternatives = _build_alternatives(orig, hira)
             items.append((orig, dict_form, alternatives[0]['hira'],
-                          alternatives[0]['hepburn'], alternatives, 0, False, pos))
+                          alternatives[0]['hepburn'], alternatives, 0, False, pos, conj))
         elif orig.isdigit():
             romaji = " ".join([r['hepburn'] for r in kks.convert(hira)])
             alternatives = ((hira, romaji, 'number'),)
-            items.append((orig, dict_form, hira, romaji, alternatives, 0, False, pos))
+            items.append((orig, dict_form, hira, romaji, alternatives, 0, False, pos, conj))
         elif not any(_is_kana(c) for c in orig):
             alternatives = ((orig, orig, 'unknown'),)
-            items.append((orig, dict_form, orig, orig, alternatives, 0, False, pos))
+            items.append((orig, dict_form, orig, orig, alternatives, 0, False, pos, conj))
         else:
             alternatives = _build_alternatives(orig, hira)
             items.append((orig, dict_form, alternatives[0]['hira'],
-                          alternatives[0]['hepburn'], alternatives, 0, False, pos))
+                          alternatives[0]['hepburn'], alternatives, 0, False, pos, conj))
 
     for i in range(len(items) - 1):
         h1 = items[i][3]
         h2 = items[i+1][3]
         if h1.endswith('tsu') and h2 and h2[0] in 'bcdfghjklmnpqrstvwxyz':
-            items[i] = items[i][:3] + (h1[:-3],) + items[i][4:6] + (True, items[i][7])
+            items[i] = items[i][:3] + (h1[:-3],) + items[i][4:6] + (True, items[i][7], items[i][8])
             items[i+1] = items[i+1][:3] + (h2[0] + h2,) + items[i+1][4:]
 
     romaji_parts = []
@@ -570,13 +593,13 @@ def _unpack_items(items_tuple):
     """Convert cached tuple representation back to list-of-dicts format."""
     result = []
     for item in items_tuple:
-        orig, df, hira, hep, alts, active, _, pos = item
+        orig, df, hira, hep, alts, active, _, pos, conj = item
         if isinstance(alts, tuple) and len(alts) > 0 and isinstance(alts[0], tuple):
             alts = [{'hira': a[0], 'hepburn': a[1], 'type': a[2]} for a in alts]
         result.append({
             'orig': orig, 'dict_form': df, 'hira': hira,
             'hepburn': hep, 'alternatives': alts, 'active_idx': active,
-            'pos': pos,
+            'pos': pos, 'conj': conj,
         })
     return result
 
@@ -1677,6 +1700,19 @@ class ScreenFreezerApp:
             coff += len(orig)
         return ''
 
+    def _get_hovered_chunk_conj(self):
+        """Return the conjugation label of the hovered kakasi chunk, or empty string."""
+        if self._card_hover_char_idx < 0 or not self._card_data:
+            return ''
+        ki = self._card_data.get('kakasi_items', [])
+        coff = 0
+        for item in ki:
+            orig = item.get('orig', '')
+            if coff <= self._card_hover_char_idx < coff + len(orig):
+                return item.get('conj', '')
+            coff += len(orig)
+        return ''
+
     def _get_combined_chunk_forms(self):
         """Return concat of adjacent chunks' original text (prev+current, current+next, prev+current+next).
         Useful for words Sudachi over-splits (e.g. ござい+ます → ございます)."""
@@ -1733,6 +1769,7 @@ class ScreenFreezerApp:
             return
 
         pos = '' if single_char else self._get_hovered_chunk_pos()
+        conj = '' if single_char else self._get_hovered_chunk_conj()
         combined = [] if single_char else self._get_combined_chunk_forms()
         card_w = max(self._card_box.get('w', 200), 200, 340)
         self._dict_lookup_seq += 1
@@ -1740,58 +1777,127 @@ class ScreenFreezerApp:
         self._withdraw_dict_card()
 
         import threading
-        t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq, single_char, pos, combined), daemon=True)
+        t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq, single_char, pos, combined, conj), daemon=True)
         t.start()
 
-    def _dict_lookup_thread(self, word, card_w, seq, single_char=False, pos='', combined=None):
+    def _get_base_form_from_jamadict(self, word):
+        """Return canonical form for inflected Japanese words based on JMdict entries."""
+        jam = _get_jam()
+        res = jam.lookup(word)
+        
+        if not res or not res.entries:
+            return word
+        
+        # Look for the most common/canonical entry
+        # Prefer entries with fewer kanji forms (simpler words)
+        best_entry = None
+        for entry in res.entries:
+            if not best_entry or len(entry.kanji_forms) < len(best_entry.kanji_forms):
+                # Check if this entry has good POS (noun, verb, adj)
+                has_good_pos = False
+                for sense in entry.senses:
+                    if sense.pos:
+                        pos_tags = [p.split('(')[0] for p in sense.pos]
+                        if any(p in ['名詞', '動詞', '形容詞', '副詞', '連体詞'] for p in pos_tags):
+                            has_good_pos = True
+                            break
+                
+                if has_good_pos:
+                    best_entry = entry
+        
+        if best_entry and best_entry.kanji_forms:
+            # Prefer the first kanji form
+            return best_entry.kanji_forms[0].text
+        elif best_entry and best_entry.kana_forms:
+            # Fall back to kana
+            return best_entry.kana_forms[0].text
+        
+        return word
+
+    def _dict_lookup_thread(self, word, card_w, seq, single_char=False, pos='', combined=None, conj=''):
         """Background thread: perform jamdict lookup and post result to main thread."""
         try:
             jam = _get_jam()
-            res = jam.lookup(word)
-
-            kanji_data = []
-            kanji_chars = [c for c in word if _is_kanji(c)]
-            for uk in set(kanji_chars):
-                char_obj = None
-                for c_obj in res.chars:
-                    if c_obj.literal == uk:
-                        char_obj = c_obj
-                        break
-                if not char_obj:
-                    try:
-                        char_res = jam.lookup(uk)
-                        if char_res.chars:
-                            char_obj = char_res.chars[0]
-                    except Exception:
-                        pass
-                if char_obj:
-                    kanji_data.append(char_obj)
-
+            
+            # Collect all candidate forms to try
+            candidates = [word]
+            
+            # Try base form for inflections
+            base_form = self._get_base_form_from_jamadict(word)
+            if base_form != word:
+                candidates.append(base_form)
+            
             # Also look up combined forms (over-split words like ござい+ます)
             extra_entries = []
             if combined is not None and combined:
-                seen_ids = {e.idseq for e in res.entries}
+                # First get all entries from candidates to check IDs
+                all_seen_ids = set()
+                for candidate in candidates:
+                    candidate_res = jam.lookup(candidate)
+                    if candidate_res and candidate_res.entries:
+                        all_seen_ids.update(e.idseq for e in candidate_res.entries)
+                
                 for cw in combined:
                     cr = jam.lookup(cw)
                     for e in cr.entries:
-                        if e.idseq not in seen_ids:
-                            seen_ids.add(e.idseq)
+                        if e.idseq not in all_seen_ids:
+                            all_seen_ids.add(e.idseq)
                             extra_entries.append(e)
-            res.entries = list(extra_entries) + list(res.entries)
+            
+            # Get entries from all candidates
+            all_entries = []
+            for candidate in candidates:
+                candidate_res = jam.lookup(candidate)
+                if candidate_res and candidate_res.entries:
+                    all_entries.extend(candidate_res.entries)
+            
+            # Add combined form entries
+            all_entries.extend(extra_entries)
+
+            # Get kanji data for the original word (for single char mode)
+            kanji_data = []
+            if single_char:
+                initial_res = jam.lookup(word)
+                if initial_res:
+                    kanji_chars = [c for c in word if _is_kanji(c)]
+                    for uk in set(kanji_chars):
+                        char_obj = None
+                        if initial_res.chars:
+                            for c_obj in initial_res.chars:
+                                if c_obj.literal == uk:
+                                    char_obj = c_obj
+                                    break
+                        if not char_obj:
+                            try:
+                                char_res = jam.lookup(uk)
+                                if char_res.chars:
+                                    char_obj = char_res.chars[0]
+                            except Exception:
+                                pass
+                        if char_obj:
+                            kanji_data.append(char_obj)
+
+            # Create a mock result object with all entries
+            class MockResult:
+                def __init__(self, entries, chars):
+                    self.entries = entries
+                    self.chars = chars
+            
+            mock_res = MockResult(all_entries, kanji_data)
 
             if single_char:
                 if not kanji_data:
                     self.root.after(0, self._dict_lookup_skip, seq)
                     return
-            elif not res.entries:
+            elif not mock_res.entries:
                 self.root.after(0, self._dict_lookup_skip, seq)
                 return
 
-            self.root.after(0, self._dict_lookup_show, word, card_w, seq, res, kanji_data, single_char, pos)
+            self.root.after(0, self._dict_lookup_show, word, card_w, seq, mock_res, kanji_data, single_char, pos, conj)
         except Exception:
             self.root.after(0, self._dict_lookup_skip, seq)
 
-    def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False, pos=''):
+    def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj=''):
         """Main thread: render dict card from lookup results."""
         if seq != self._dict_lookup_seq:
             return
@@ -1853,6 +1959,10 @@ class ScreenFreezerApp:
         wrap_w = max(card_w - 16, 180)
         wrap_w_inner = max(card_w - 22, 170)
 
+        if conj:
+            canvas.create_text(pad_x, ly, text=conj, font=pos_font, fill="#8e8e93", anchor="nw")
+            ly += pos_h + 2
+
         if not single_char:
             entries = list(res.entries)
             entries.sort(key=lambda e: (
@@ -1877,11 +1987,11 @@ class ScreenFreezerApp:
 
                 for si, sense in enumerate(entry.senses[:3]):
                     glosses = ", ".join(g.text for g in sense.gloss)
-                    pos = " • ".join(sense.pos) if sense.pos else ""
+                    pos_str = " • ".join(sense.pos) if sense.pos else ""
 
-                    if pos:
-                        canvas.create_text(pad_x + 6, ly, text=pos, font=pos_font, fill="#8e8e93", anchor="nw", width=wrap_w_inner)
-                        ly += _nlines(pf, pos, wrap_w_inner) * pos_h + 2
+                    if pos_str:
+                        canvas.create_text(pad_x + 6, ly, text=pos_str, font=pos_font, fill="#8e8e93", anchor="nw", width=wrap_w_inner)
+                        ly += _nlines(pf, pos_str, wrap_w_inner) * pos_h + 2
 
                     def_text = f"{si + 1}. {glosses}"
                     canvas.create_text(pad_x + 6, ly, text=def_text, font=body_font, fill="#1c1c1e", anchor="nw", width=wrap_w_inner)
