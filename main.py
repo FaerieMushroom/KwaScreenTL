@@ -1713,6 +1713,19 @@ class ScreenFreezerApp:
             coff += len(orig)
         return ''
 
+    def _get_hovered_chunk_hira(self):
+        """Return Sudachi's contextual hiragana reading for the hovered chunk, or empty string."""
+        if self._card_hover_char_idx < 0 or not self._card_data:
+            return ''
+        ki = self._card_data.get('kakasi_items', [])
+        coff = 0
+        for item in ki:
+            orig = item.get('orig', '')
+            if coff <= self._card_hover_char_idx < coff + len(orig):
+                return item.get('hira', '')
+            coff += len(orig)
+        return ''
+
     def _get_combined_chunk_forms(self):
         """Return concat of adjacent chunks' original text (prev+current, current+next, prev+current+next).
         Useful for words Sudachi over-splits (e.g. ござい+ます → ございます)."""
@@ -1770,6 +1783,7 @@ class ScreenFreezerApp:
 
         pos = '' if single_char else self._get_hovered_chunk_pos()
         conj = '' if single_char else self._get_hovered_chunk_conj()
+        hira = '' if single_char else self._get_hovered_chunk_hira()
         combined = [] if single_char else self._get_combined_chunk_forms()
         card_w = max(self._card_box.get('w', 200), 200, 340)
         self._dict_lookup_seq += 1
@@ -1777,7 +1791,7 @@ class ScreenFreezerApp:
         self._withdraw_dict_card()
 
         import threading
-        t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq, single_char, pos, combined, conj), daemon=True)
+        t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq, single_char, pos, combined, conj, hira), daemon=True)
         t.start()
 
     def _get_base_form_from_jamadict(self, word):
@@ -1814,7 +1828,7 @@ class ScreenFreezerApp:
         
         return word
 
-    def _dict_lookup_thread(self, word, card_w, seq, single_char=False, pos='', combined=None, conj=''):
+    def _dict_lookup_thread(self, word, card_w, seq, single_char=False, pos='', combined=None, conj='', hira=''):
         """Background thread: perform jamdict lookup and post result to main thread."""
         try:
             jam = _get_jam()
@@ -1893,11 +1907,45 @@ class ScreenFreezerApp:
                 self.root.after(0, self._dict_lookup_skip, seq)
                 return
 
-            self.root.after(0, self._dict_lookup_show, word, card_w, seq, mock_res, kanji_data, single_char, pos, conj)
+            self.root.after(0, self._dict_lookup_show, word, card_w, seq, mock_res, kanji_data, single_char, pos, conj, hira)
         except Exception:
             self.root.after(0, self._dict_lookup_skip, seq)
 
-    def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj=''):
+    def _sort_jamdict_entries(self, entries, pos='', hira=''):
+        """Prioritize entries whose kana forms match the contextual reading."""
+        if not entries:
+            return []
+
+        def _normalize_hira(text):
+            try:
+                return jaconv.kata2hira(text) if text else ''
+            except Exception:
+                return str(text or '')
+
+        def _reading_rank(entry):
+            if not hira:
+                return 2
+            target = _normalize_hira(hira)
+            kana_forms = [_normalize_hira(getattr(k, 'text', '')) for k in getattr(entry, 'kana_forms', []) if getattr(k, 'text', '')]
+            if any(k == target for k in kana_forms):
+                return 0
+            if any(target in k or k in target for k in kana_forms):
+                return 1
+            return 2
+
+        def _pos_rank(entry):
+            if pos in {'particle', 'auxiliary verb', 'conjunction', 'interjection', 'prefix', 'suffix'} and any(p == pos for s in entry.senses for p in (s.pos or [])):
+                return 0
+            if any(p == 'particle' for s in entry.senses for p in (s.pos or [])):
+                return 1
+            return 2
+
+        def _form_rank(entry):
+            return 0 if not entry.kanji_forms else 1
+
+        return sorted(entries, key=lambda entry: (_reading_rank(entry), _pos_rank(entry), _form_rank(entry)))
+
+    def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj='', hira=''):
         """Main thread: render dict card from lookup results."""
         if seq != self._dict_lookup_seq:
             return
@@ -1963,13 +2011,12 @@ class ScreenFreezerApp:
             canvas.create_text(pad_x, ly, text=conj, font=pos_font, fill="#8e8e93", anchor="nw")
             ly += pos_h + 2
 
+        # POS boost: only trust it for closed-class / grammatical words where
+        # the tag is a reliable disambiguation signal. For broad open-class
+        # categories (noun, verb, adjective, adverb …) many unrelated JMdict
+        # entries share the same POS so the contextual reading is better.
         if not single_char:
-            entries = list(res.entries)
-            entries.sort(key=lambda e: (
-                0 if pos and any(p == pos for s in e.senses for p in (s.pos or []))
-                else 1 if any(p == 'particle' for s in e.senses for p in (s.pos or []))
-                else (2 if not e.kanji_forms else 3)
-            ))
+            entries = self._sort_jamdict_entries(list(res.entries), pos=pos, hira=hira)
             for entry in entries[:4]:
                 kanji_texts = [k.text for k in entry.kanji_forms]
                 kana_texts = [k.text for k in entry.kana_forms]
@@ -2108,16 +2155,41 @@ class ScreenFreezerApp:
         canvas.update_idletasks()
         bbox = canvas.bbox("all")
         dict_h = (bbox[3] if bbox else ly) + 8
-        dict_x = self.overlay_x
-        dict_y = self.overlay_y + self.overlay_h + 4
 
+        # --- Dict card placement: keep it OUTSIDE the frozen OCR region so
+        # hovering over it doesn't fire a Leave on the OCR box and close itself.
+        #
+        # Strategy:
+        #   1. Try LEFT of the OCR region (overlay_x - card_w - 4).
+        #   2. Fall back to RIGHT of the region (overlay_x + overlay_w + 4).
+        #   3. Vertically: align top to the hovered word row, clamped on screen.
+        screen_limit_x = 1920
         screen_limit_y = 1080
         try:
+            screen_limit_x = self.root.winfo_screenwidth()
             screen_limit_y = self.root.winfo_screenheight()
         except Exception:
             pass
-        if dict_y + dict_h > screen_limit_y:
-            dict_y += screen_limit_y - (dict_y + dict_h)
+
+        # Vertical anchor: top of the hovered OCR box row on screen.
+        try:
+            ob = self._card_box.get('orig_bbox', {})
+            word_screen_y = int(self.overlay_y + ob.get('y', 0))
+        except Exception:
+            word_screen_y = self.overlay_y
+        # Prefer to start at the word row, but clamp so card stays on screen.
+        dict_y = max(0, min(word_screen_y, screen_limit_y - dict_h))
+
+        # Horizontal: try left side first.
+        left_x = self.overlay_x - card_w - 4
+        right_x = self.overlay_x + self.overlay_w + 4
+        if left_x >= 0:
+            dict_x = left_x
+        elif right_x + card_w <= screen_limit_x:
+            dict_x = right_x
+        else:
+            # Neither side fits cleanly — use left side, clamped to 0.
+            dict_x = max(0, left_x)
 
         self._dict_window.geometry(f"{card_w}x{dict_h}+{dict_x}+{dict_y}")
         self._dict_window.lift()
