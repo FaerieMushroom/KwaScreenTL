@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.wintypes
 import json
+import logging
 import os
 import queue
 import re
@@ -19,12 +20,61 @@ import msvcrt
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 STD_ERROR_HANDLE = -12
 _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
-_log_fd = os.open(_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-_log_handle = msvcrt.get_osfhandle(_log_fd)
-kernel32.SetStdHandle(STD_ERROR_HANDLE, _log_handle)
-os.dup2(_log_fd, 2)
-os.close(_log_fd)
-sys.stderr = open(_log_path, "a", encoding="utf-8")
+try:
+    _log_fd = os.open(_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    _log_handle = msvcrt.get_osfhandle(_log_fd)
+    kernel32.SetStdHandle(STD_ERROR_HANDLE, _log_handle)
+    os.dup2(_log_fd, 2)
+    os.close(_log_fd)
+    sys.stderr = open(_log_path, "a", encoding="utf-8")
+except Exception:
+    pass
+
+# Keep a writable handle for the click-event logging path.
+try:
+    _debug_log_handle = open(_log_path, "a", encoding="utf-8")
+except Exception:
+    _debug_log_handle = None
+
+
+def _append_debug_log(msg):
+    try:
+        if _debug_log_handle is not None:
+            _debug_log_handle.write(msg + "\n")
+            _debug_log_handle.flush()
+        else:
+            print(msg, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _log_click_event(box_data, hovered_chunk, top_entry=None, candidates=None):
+    try:
+        region_text = box_data.get('original', '') or ''
+        chunks = [item.get('orig', '') for item in box_data.get('kakasi_items', []) if item.get('orig')]
+        chunk_text = hovered_chunk or ''
+        top_header = ''
+        if top_entry is not None:
+            kanji_texts = [k.text for k in getattr(top_entry, 'kanji_forms', [])]
+            kana_texts = [k.text for k in getattr(top_entry, 'kana_forms', [])]
+            header_parts = []
+            if kanji_texts:
+                header_parts.append('/'.join(kanji_texts))
+            if kana_texts:
+                header_parts.append('(' + ', '.join(kana_texts) + ')')
+            top_header = ' '.join(header_parts)
+        candidate_text = ''
+        if candidates:
+            candidate_text = ','.join(candidates).replace('|', '／')
+        _append_debug_log(
+            "CLICK_EVENT|region_text=" + region_text.replace('\n', ' ').replace('|', '／') +
+            "|chunks=" + ','.join(chunks).replace('|', '／') +
+            "|clicked_chunk=" + chunk_text.replace('|', '／') +
+            "|candidates=" + candidate_text +
+            "|top_dict_def=" + top_header.replace('|', '／')
+        )
+    except Exception as exc:
+        _append_debug_log(f"CLICK_EVENT|error={exc}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── OCR engine selector ──────────────────────────────────────────────────────
@@ -37,6 +87,18 @@ OCR_ENGINE = "paddle"
 # "google"  → Google Translate (online, free, no key needed)
 # "deepl"   → DeepL API  (online, needs key in deeplapikey.txt)
 TRANSLATOR = "deepl"
+DEBUG_DICT_LOG = os.getenv("KWS_DEBUG_DICT", "0") == "1"
+
+if DEBUG_DICT_LOG:
+    logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(message)s")
+    logger = logging.getLogger("kws.dict")
+    if _debug_log_handle:
+        handler = logging.StreamHandler(_debug_log_handle)
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
+        logger.addHandler(handler)
+else:
+    logger = logging.getLogger("kws.dict")
+    logger.addHandler(logging.NullHandler())
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Language filter ─────────────────────────────────────────────────────────
@@ -655,6 +717,98 @@ def get_line_bounding_rect(line):
         'width': max_right - min_x,
         'height': max_bottom - min_y
     }
+
+
+def _sort_jamdict_entries(entries, pos='', hira='', word='', conj=''):
+    """Prioritize entries whose kana forms match the contextual reading and word form."""
+    if not entries:
+        return []
+
+    def _normalize_hira(text):
+        try:
+            return jaconv.kata2hira(text) if text else ''
+        except Exception:
+            return str(text or '')
+
+    def _reading_rank(entry):
+        if not hira:
+            return 2
+        target = _normalize_hira(hira)
+        kana_forms = [_normalize_hira(getattr(k, 'text', '')) for k in getattr(entry, 'kana_forms', []) if getattr(k, 'text', '')]
+        if any(k == target for k in kana_forms):
+            return 0
+        if any(target in k or k in target for k in kana_forms):
+            return 1
+        return 2
+
+    def _word_rank(entry):
+        if not word:
+            return 1
+        word_norm = str(word).strip()
+        if not word_norm:
+            return 1
+        kanji_forms = [getattr(k, 'text', '') for k in getattr(entry, 'kanji_forms', []) if getattr(k, 'text', '')]
+        if any(k == word_norm for k in kanji_forms):
+            return 0
+        if any(word_norm in k or k in word_norm for k in kanji_forms):
+            return 1
+        return 2
+
+    def _sense_rank(entry):
+        if not entry.senses:
+            return 2
+        pos_tags = []
+        for sense in entry.senses:
+            pos_tags.extend(getattr(sense, 'pos', []) or [])
+        if pos in {'verb', 'adjective', 'noun', 'particle'} and any(p == pos for p in pos_tags):
+            return 0
+        if pos in {'verb'} and any('verb' in p.lower() for p in pos_tags):
+            return 1
+        if any('verb' in p.lower() for p in pos_tags):
+            return 2
+        return 3
+
+    def _context_rank(entry):
+        if pos != 'verb':
+            return 2
+
+        glosses = [g.text.lower() for s in entry.senses for g in getattr(s, 'gloss', [])]
+        if not glosses:
+            return 2
+
+        # Generic verb-stem / inflected-form preference: prefer common predicate-style senses
+        # when the chunk is functioning as a verbal stem, even if the conjugation label is missing.
+        generic_glosses = {
+            'to be', 'to exist', 'to stay', 'to go', 'to come', 'to do', 'to make', 'to have',
+            'to say', 'to know', 'to think', 'to see', 'to eat', 'to drink', 'to sleep',
+            'to live', 'to use', 'to take', 'to get', 'to give', 'to become', 'to return',
+            'to wait', 'to work', 'to move', 'to happen', 'to arrive', 'to want', 'to need'
+        }
+        if any(gloss in generic_glosses for gloss in glosses):
+            return 0
+        if any(gloss.startswith('to be') or gloss.startswith('to exist') or gloss.startswith('to stay') or gloss.startswith('to go') or gloss.startswith('to come') or gloss.startswith('to do') or gloss.startswith('to make') or gloss.startswith('to have') for gloss in glosses):
+            return 1
+        # For verbal stems like すい / じゃい, prefer entries whose glosses reflect the contextual
+        # predicate meaning over the raw inflected form's base dictionary entry when the chunk is part of a larger phrase.
+        if any(token in {'すい', 'じゃい', 'おり', '炊い'} for token in {hira, word, _normalize_hira(hira)}):
+            if any('to eat' in gloss or 'to go' in gloss or 'to become' in gloss or 'to be' in gloss or 'to die' in gloss for gloss in glosses):
+                return 0
+        if conj and any(token in conj.lower() for token in ('stem', 'form', 'te', 'ta', 'masu', 'polite')):
+            return 1
+        return 2
+
+    def _pos_rank(entry):
+        if pos in {'particle', 'auxiliary verb', 'conjunction', 'interjection', 'prefix', 'suffix'} and any(p == pos for s in entry.senses for p in (s.pos or [])):
+            return 0
+        if any(p == 'particle' for s in entry.senses for p in (s.pos or [])):
+            return 1
+        return 2
+
+    def _form_rank(entry):
+        return 0 if not entry.kanji_forms else 1
+
+    return sorted(entries, key=lambda entry: (_reading_rank(entry), _word_rank(entry), _context_rank(entry), _sense_rank(entry), _pos_rank(entry), _form_rank(entry)))
+
 
 class ScreenFreezerApp:
     def __init__(self):
@@ -1776,6 +1930,10 @@ class ScreenFreezerApp:
             self._withdraw_dict_card()
             return
 
+        hovered_chunk = self._get_hovered_chunk_text()
+        if hovered_chunk:
+            _log_click_event(self._card_data, hovered_chunk)
+
         word = self._get_hovered_single_char() if single_char else self._get_hovered_chunk_dict_form()
         if not word or not contains_japanese(word):
             self._withdraw_dict_card()
@@ -1785,6 +1943,7 @@ class ScreenFreezerApp:
         conj = '' if single_char else self._get_hovered_chunk_conj()
         hira = '' if single_char else self._get_hovered_chunk_hira()
         combined = [] if single_char else self._get_combined_chunk_forms()
+        _append_debug_log(f"dict card update: single_char={single_char} char_idx={self._card_hover_char_idx} word={word!r} pos={pos!r} conj={conj!r} hira={hira!r} combined={combined}")
         card_w = max(self._card_box.get('w', 200), 200, 340)
         self._dict_lookup_seq += 1
         seq = self._dict_lookup_seq
@@ -1833,7 +1992,7 @@ class ScreenFreezerApp:
         try:
             jam = _get_jam()
             
-            # Collect all candidate forms to try
+            # Collect all candidate forms to try, including richer combined forms
             candidates = [word]
             
             # Try base form for inflections
@@ -1844,6 +2003,10 @@ class ScreenFreezerApp:
             # Also look up combined forms (over-split words like ござい+ます)
             extra_entries = []
             if combined is not None and combined:
+                for cw in combined:
+                    if cw not in candidates and contains_japanese(cw):
+                        candidates.append(cw)
+
                 # First get all entries from candidates to check IDs
                 all_seen_ids = set()
                 for candidate in candidates:
@@ -1891,6 +2054,8 @@ class ScreenFreezerApp:
                         if char_obj:
                             kanji_data.append(char_obj)
 
+            _append_debug_log(f"dict lookup thread: word={word!r} candidates={candidates} entries={len(all_entries)}")
+
             # Create a mock result object with all entries
             class MockResult:
                 def __init__(self, entries, chars):
@@ -1910,40 +2075,6 @@ class ScreenFreezerApp:
             self.root.after(0, self._dict_lookup_show, word, card_w, seq, mock_res, kanji_data, single_char, pos, conj, hira)
         except Exception:
             self.root.after(0, self._dict_lookup_skip, seq)
-
-    def _sort_jamdict_entries(self, entries, pos='', hira=''):
-        """Prioritize entries whose kana forms match the contextual reading."""
-        if not entries:
-            return []
-
-        def _normalize_hira(text):
-            try:
-                return jaconv.kata2hira(text) if text else ''
-            except Exception:
-                return str(text or '')
-
-        def _reading_rank(entry):
-            if not hira:
-                return 2
-            target = _normalize_hira(hira)
-            kana_forms = [_normalize_hira(getattr(k, 'text', '')) for k in getattr(entry, 'kana_forms', []) if getattr(k, 'text', '')]
-            if any(k == target for k in kana_forms):
-                return 0
-            if any(target in k or k in target for k in kana_forms):
-                return 1
-            return 2
-
-        def _pos_rank(entry):
-            if pos in {'particle', 'auxiliary verb', 'conjunction', 'interjection', 'prefix', 'suffix'} and any(p == pos for s in entry.senses for p in (s.pos or [])):
-                return 0
-            if any(p == 'particle' for s in entry.senses for p in (s.pos or [])):
-                return 1
-            return 2
-
-        def _form_rank(entry):
-            return 0 if not entry.kanji_forms else 1
-
-        return sorted(entries, key=lambda entry: (_reading_rank(entry), _pos_rank(entry), _form_rank(entry)))
 
     def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj='', hira=''):
         """Main thread: render dict card from lookup results."""
@@ -2016,8 +2147,27 @@ class ScreenFreezerApp:
         # categories (noun, verb, adjective, adverb …) many unrelated JMdict
         # entries share the same POS so the contextual reading is better.
         if not single_char:
-            entries = self._sort_jamdict_entries(list(res.entries), pos=pos, hira=hira)
-            for entry in entries[:4]:
+            entries = _sort_jamdict_entries(list(res.entries), pos=pos, hira=hira, word=word, conj=conj)
+            if DEBUG_DICT_LOG:
+                _append_debug_log(f"dict lookup show: word={word!r} pos={pos!r} conj={conj!r} hira={hira!r} entries={len(entries)}")
+                for entry in entries[:4]:
+                    kanji_texts = [k.text for k in entry.kanji_forms]
+                    kana_texts = [k.text for k in entry.kana_forms]
+                    glosses = [g.text for s in entry.senses[:1] for g in getattr(s, 'gloss', [])]
+                    _append_debug_log(f"  ranked: kanji={kanji_texts} kana={kana_texts} gloss={glosses}")
+
+            preferred_entries = list(entries)
+            if pos == 'verb' and hira and any(ch in hira for ch in 'おり'):
+                for i, entry in enumerate(preferred_entries):
+                    glosses = [g.text.lower() for s in entry.senses for g in getattr(s, 'gloss', [])]
+                    if any(g.startswith('to be') or g.startswith('to exist') or g.startswith('to stay') for g in glosses):
+                        preferred_entries.insert(0, preferred_entries.pop(i))
+                        break
+
+            top_entry = None
+            for idx, entry in enumerate(preferred_entries[:4]):
+                if idx == 0:
+                    top_entry = entry
                 kanji_texts = [k.text for k in entry.kanji_forms]
                 kana_texts = [k.text for k in entry.kana_forms]
                 header = ""
@@ -2045,6 +2195,11 @@ class ScreenFreezerApp:
                     ly += _nlines(bf, def_text, wrap_w_inner) * body_h + 4
 
         kanji_chars = [c for c in word if _is_kanji(c)]
+        if top_entry is not None:
+            hovered_chunk = self._get_hovered_chunk_text()
+            if hovered_chunk:
+                _log_click_event(self._card_data, hovered_chunk, top_entry=top_entry, candidates=[word] + ([base_form] if base_form != word else []) + ([cw for cw in combined if cw not in candidates and contains_japanese(cw)] if isinstance(combined, list) else []))
+
         if single_char and kanji_chars:
             unique_kanjis = []
             seen_k = set()
