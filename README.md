@@ -17,17 +17,15 @@ Screen translation tool for Japanese applications. Captures the active monitor, 
 | `Ctrl+Alt+Shift+E` | Capture hovered window / dismiss OCR boxes |
 | `Ctrl+Alt+Shift+R` | Snip mode (drag-select a region) |
 | `Ctrl+Alt+Shift+S` | Toggle settings panel |
-| `Escape` | (in snip mode) Cancel selection |
 
 | Mouse (on OCR box) | Action |
 |---|---|
 | `Hover` | Show translation card |
-| `Click+drag` | Select text to copy |
-| `Ctrl+Click` | Show kanji info |
-| `Right-click` | Open in Jisho |
-| `Shift+Right-click` | Open in DeepL |
+|` Click` | Show dictionary |
+| `Right-click` | Show kanji info |
+| `Ctrl+Click` | Show kanji info (with hover highlight) |
 | `Middle-click` | Text-to-speech |
-| `Mousewheel` (over card) | Scroll |
+| `Mousewheel` (over kanji) | Scroll possible kanji readings |
 
 ## Features
 

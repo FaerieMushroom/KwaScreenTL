@@ -1775,7 +1775,6 @@ class ScreenFreezerApp:
             canvas.bind("<B1-Motion>", lambda e, i=idx: self._box_drag(e, i))
             canvas.bind("<ButtonRelease-1>", lambda e, i=idx: self._box_release(e, i))
             canvas.bind("<Button-3>", lambda e, i=idx: self._box_right_click(e, i))
-            canvas.bind("<Shift-Button-3>", lambda e, i=idx: self._box_shift_right_click(e, i))
             canvas.bind("<Button-2>", lambda e, i=idx: self._box_middle_click(e, i))
 
             # Focus this box window so check_focus doesn't hide the overlay
@@ -2568,19 +2567,31 @@ class ScreenFreezerApp:
             return text.strip()
         return None
 
-    def _box_right_click(self, _event, idx):
-        """Right-click on a box → open in Jisho."""
-        text = self._get_action_text(idx)
-        if text:
-            url = f"https://jisho.org/search/{urllib.parse.quote(text)}"
-            webbrowser.open(url)
-
-    def _box_shift_right_click(self, _event, idx):
-        """Shift+Right-click on a box → open in DeepL."""
-        text = self._get_action_text(idx)
-        if text:
-            url = f"https://www.deepl.com/en/translator#ja/en/{urllib.parse.quote(text)}"
-            webbrowser.open(url)
+    def _box_right_click(self, event, idx):
+        """Right-click on a box → single-character kanji lookup."""
+        if idx < 0 or idx >= len(self.ocr_boxes):
+            return
+        box = self.ocr_boxes[idx]
+        bbox = box['orig_bbox']
+        words = box.get('words', [])
+        if not words:
+            return
+        ox = bbox['x'] - BOX_PAD + event.x
+        oy = bbox['y'] - BOX_PAD + event.y
+        wi = -1
+        for i, w in enumerate(words):
+            if w['x'] <= ox <= w['x'] + w['width'] and \
+               w['y'] <= oy <= w['y'] + w['height']:
+                wi = i
+                break
+        if wi < 0:
+            return
+        char_off = sum(len(words[j]['text']) for j in range(wi))
+        self._card_hover_char_idx = char_off
+        self._card_data = box['data']
+        self._card_data_idx = idx
+        self._card_box = box
+        self._update_dict_card(single_char=True)
 
     def _box_middle_click(self, _event, idx):
         """Middle-click on a box → TTS."""
@@ -3137,10 +3148,13 @@ def main():
     app = ScreenFreezerApp()
     app._prewarm_event.wait()
     print("Application Ready\n")
-    print("  Ctrl+Alt+Shift+E  Capture game window for OCR / translation")
-    print("  Ctrl+Alt+Shift+R  Snip mode (drag-select a region)")
+    print("  Ctrl+Alt+Shift+E  Capture / Uncapture window for OCR / translation")
+    print("  Ctrl+Alt+Shift+R  Snip mode (drag-select a region) (Uses above for uncapture)")
     print("  Ctrl+Alt+Shift+S  Settings panel")
-    print("  Press Escape while frozen to unfreeze and restore focus.")
+    print("  Click             Open Dictionary")
+    print("  Right-Click       Kanji info")
+    print("  Ctrl+Click        Kanji info (with hover highlighting)")
+    print("  Middle-click      Text-to-speech")
 
     # Prompt for DeepL key on first launch if that translator is selected
     if app.translator == "deepl":
