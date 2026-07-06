@@ -1,8 +1,10 @@
 # KwaScreenTL
 
+![Screenshot](/Docs/CaptureExample.png)
+
 ⚠️ Warning: AI vibe coded slop ⚠️
 
-Screen translation tool for Japanese applications. Captures the active monitor, runs OCR via PaddleOCR, translates using DeepL, and displays popup cards with dictionary data (JMdict/Jamdict).
+Screen translation tool for Japanese applications. Runs OCR via PaddleOCR, translates using DeepL / Google translate, and displays popup cards with dictionary data (JMdict/Jamdict).
 
 ## Setup
 
@@ -29,20 +31,19 @@ Screen translation tool for Japanese applications. Captures the active monitor, 
 
 ## Features
 
-- **PaddleOCR** (`japan` model, ONNX runtime) with per-character bounding boxes
-- **DeepL** translation (free API) with romaji/kana via pykakasi
-- **JMdict** (via Jamdict) for word/kanji definitions — local offline dictionary
-- **Snip mode** for manual region capture
-- **Skip non-Japanese** mode to filter out non-JP OCR results
-- **Text-to-speech** via edge-tts (ja-JP-NanamiNeural)
-- All library output (paddle, onnxruntime) redirected to `app.log`
+- Captures the active window or a selected screen region via OCR
+- Displays romaji, kana, and furigana readings
+- Translates Japanese text to English (DeepL or Google)
+- Local offline dictionary lookups (JMdict) for words and individual kanji
+- Snip mode for manual region capture
+- Toggle visibility of translation and romaji display 
+- Text-to-speech
 
 ## Settings
 
 Toggles in the settings panel (`Ctrl+Alt+Shift+S`), persisted to `settings.json`:
 - **Show romaji / Show translation** — hover card display
 - **Skip non-Japanese text** — filter non-JP OCR results
-- **Show cropped image** — debug: show the OCR crop in the hover card
 - **OCR Prepass Scale** — % scale for faster region detection (25/50/75/100)
 
 ## Used Libraries
