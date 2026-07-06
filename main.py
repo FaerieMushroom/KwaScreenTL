@@ -1039,9 +1039,9 @@ class ScreenFreezerApp:
                     vc = getattr(self, '_last_ocr_vcount', 0)
                     hc = getattr(self, '_last_ocr_hcount', 0)
                     mode = ""
-                    if vc and hc: mode = f" [V{hc} H{vc}]"
-                    elif vc: mode = f" [V{vc}]"
+                    if vc and hc: mode = f" [H{hc} V{vc}]"
                     elif hc: mode = f" [H{hc}]"
+                    elif vc: mode = f" [V{vc}]"
                     print(f"OCR: {data} regions, {ocr_ms:.0f}ms {dims}{mode}")
                     print(f"Processing: {proc_ms:.0f}ms")
                     if trans_ms:
