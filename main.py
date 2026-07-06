@@ -85,8 +85,8 @@ OCR_ENGINE = "paddle"
 
 # ── Translation backend ──────────────────────────────────────────────────────
 # "google"  → Google Translate (online, free, no key needed)
-# "deepl"   → DeepL API  (online, needs key in deeplapikey.txt)
-TRANSLATOR = "deepl"
+# "deepl"   → DeepL API  (online, needs key in apikeys.json)
+TRANSLATOR = "google"
 DEBUG_DICT_LOG = os.getenv("KWS_DEBUG_DICT", "0") == "1"
 
 if DEBUG_DICT_LOG:
@@ -124,6 +124,7 @@ CARD_BG = "#f2f2f7"
 
 import tkinter as tk
 import tkinter.font as tkfont
+import tkinter.simpledialog as tksd
 from PIL import Image, ImageTk
 import mss
 import jaconv
@@ -136,19 +137,27 @@ from functools import lru_cache
 import webbrowser
 import urllib.parse
 
-# ── DeepL API key loader ───────────────────────────────────────────────────
+# ── API keys (JSON) ─────────────────────────────────────────────────────────
+_API_KEYS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apikeys.json")
+
+def _load_api_keys():
+    try:
+        with open(_API_KEYS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_api_keys(keys):
+    with open(_API_KEYS_FILE, "w") as f:
+        json.dump(keys, f, indent=2)
+
 _deepl_api_key = None
 
 def get_deepl_api_key():
     global _deepl_api_key
     if _deepl_api_key is None:
-        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deeplapikey.txt")
-        try:
-            with open(key_path, "r") as f:
-                _deepl_api_key = f.read().strip()
-        except Exception as e:
-            pass
-            _deepl_api_key = ""
+        keys = _load_api_keys()
+        _deepl_api_key = keys.get("deepl", "")
     return _deepl_api_key
 
 # ── PaddleOCR lazy loader ──────────────────────────────────────────────────
@@ -188,7 +197,7 @@ def translate_deepl(text):
     import requests
     key = get_deepl_api_key()
     if not key:
-        return "[DeepL: no API key - add to deeplapikey.txt]"
+        return "[DeepL: no API key - add to apikeys.json]"
     resp = requests.post(
         "https://api-free.deepl.com/v2/translate",
         headers={"Authorization": f"DeepL-Auth-Key {key}"},
@@ -199,19 +208,20 @@ def translate_deepl(text):
     resp.raise_for_status()
     return resp.json()["translations"][0]["text"]
 
-_deepl_cache = {}
-_deepl_hits = 0
-_deepl_misses = 0
+_translation_cache = {}
+_trans_hits = 0
+_trans_misses = 0
 
 def _translate_or_cached(text):
-    """Return cached DeepL result or translate and cache it."""
-    global _deepl_hits, _deepl_misses
-    if text in _deepl_cache:
-        _deepl_hits += 1
-        return _deepl_cache[text]
-    _deepl_misses += 1
+    """Return cached translation result or translate and cache it."""
+    global _trans_hits, _trans_misses
+    if text in _translation_cache:
+        _trans_hits += 1
+        return _translation_cache[text]
+    _trans_misses += 1
     result = translate_deepl(text)
-    _deepl_cache[text] = result
+    if not result.startswith("["):
+        _translation_cache[text] = result
     return result
 
 def translate_deepl_batch(texts):
@@ -221,7 +231,7 @@ def translate_deepl_batch(texts):
     import requests
     key = get_deepl_api_key()
     if not key:
-        return ["[DeepL: no API key - add to deeplapikey.txt]"] * len(texts)
+        return ["[DeepL: no API key - add to apikeys.json]"] * len(texts)
     resp = requests.post(
         "https://api-free.deepl.com/v2/translate",
         headers={"Authorization": f"DeepL-Auth-Key {key}"},
@@ -847,6 +857,7 @@ class ScreenFreezerApp:
         self.show_romaji = True
         self.skip_non_japanese = SKIP_NON_JAPANESE
         self.show_translation = True
+        self.translator = TRANSLATOR
         self.region_detect_scale = 100
         self.japanese_font = "Meiryo"
         self.japanese_font_size = 16
@@ -1005,12 +1016,12 @@ class ScreenFreezerApp:
                     dm = ci.misses - prev_misses
                     self._prev_cache_hits = ci.hits
                     self._prev_cache_misses = ci.misses
-                    print(f"Cache: {dh} hits, {dm} misses, {ci.currsize} entries")
-                    dh2 = _deepl_hits - getattr(self, '_prev_deepl_hits', 0)
-                    dm2 = _deepl_misses - getattr(self, '_prev_deepl_misses', 0)
-                    self._prev_deepl_hits = _deepl_hits
-                    self._prev_deepl_misses = _deepl_misses
-                    print(f"DeepL cache: {dh2} hits, {dm2} misses, {len(_deepl_cache)} entries")
+                    print(f"Processing cache: {dh} hits, {dm} misses, {ci.currsize} entries")
+                    dh2 = _trans_hits - getattr(self, '_prev_trans_hits', 0)
+                    dm2 = _trans_misses - getattr(self, '_prev_trans_misses', 0)
+                    self._prev_trans_hits = _trans_hits
+                    self._prev_trans_misses = _trans_misses
+                    print(f"Translation cache: {dh2} hits, {dm2} misses, {len(_translation_cache)} entries")
                     print(f"Total: {total:.0f}ms\n")
                     # Re-render card if currently showing (data was updated in-place)
                     if self._card_window and self._card_data_idx >= 0:
@@ -1042,6 +1053,7 @@ class ScreenFreezerApp:
             self.show_romaji = data.get("show_romaji", True)
             self.skip_non_japanese = data.get("skip_non_japanese", SKIP_NON_JAPANESE)
             self.show_translation = data.get("show_translation", True)
+            self.translator = data.get("translator", TRANSLATOR)
             self.region_detect_scale = data.get("region_detect_scale", 100)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -1052,6 +1064,7 @@ class ScreenFreezerApp:
             "show_romaji": self.show_romaji,
             "skip_non_japanese": self.skip_non_japanese,
             "show_translation": self.show_translation,
+            "translator": self.translator,
             "region_detect_scale": self.region_detect_scale,
         }
         with open(self._settings_file, "w") as f:
@@ -1100,6 +1113,27 @@ class ScreenFreezerApp:
         tk.Checkbutton(win, text="Show translation", variable=self._show_translation_var,
                        command=on_toggle).pack(anchor="w", **pad)
 
+        tk.Label(win, text="Translator", font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        sep_t = tk.Frame(win, height=1, bg="#c0c0c0")
+        sep_t.pack(fill="x", padx=12)
+
+        self._translator_var = tk.StringVar(value=self.translator)
+        def on_translator_change(*_):
+            val = self._translator_var.get()
+            self.translator = val
+            self._save_settings()
+            _translation_cache.clear()
+            if val == "deepl":
+                self._ensure_deepl_key()
+
+        self._translator_var.trace_add("write", on_translator_change)
+
+        f_trans = tk.Frame(win)
+        f_trans.pack(fill="x", padx=12, pady=3)
+        tk.Label(f_trans, text="Service:", anchor="w", width=20).pack(side="left")
+        tk.OptionMenu(f_trans, self._translator_var, "deepl", "google").pack(side="left")
+
         tk.Label(win, text="OCR Filter", font=("Segoe UI", 9, "bold"),
                  anchor="w").pack(fill="x", padx=12, pady=(10, 2))
         sep2 = tk.Frame(win, height=1, bg="#c0c0c0")
@@ -1143,6 +1177,22 @@ class ScreenFreezerApp:
             setattr(self, '_settings_window', None), win.destroy()
         ))
 
+    def _ensure_deepl_key(self):
+        if get_deepl_api_key():
+            return
+        key = tksd.askstring("DeepL API Key", "Enter your DeepL API key:", parent=self._settings_window or self.root)
+        if key:
+            key = key.strip()
+            try:
+                keys = _load_api_keys()
+                keys["deepl"] = key
+                _save_api_keys(keys)
+                global _deepl_api_key
+                _deepl_api_key = key
+            except Exception as e:
+                import tkinter.messagebox as tkmb
+                tkmb.showerror("Error", f"Failed to save API key:\n{e}", parent=self._settings_window or self.root)
+
     def _refresh_hover_card(self):
         self._hide_card()
         if self.current_hover_idx >= 0 and self.current_hover_idx < len(self.ocr_boxes):
@@ -1156,7 +1206,7 @@ class ScreenFreezerApp:
                 text = box['data'].get('original', '')
                 if text and not box['data'].get('english'):
                     try:
-                        if TRANSLATOR == "deepl":
+                        if self.translator == "deepl":
                             eng = _translate_or_cached(text)
                         else:
                             eng = GoogleTranslator(source='ja', target='en').translate(text)
@@ -1534,24 +1584,26 @@ class ScreenFreezerApp:
             if self.show_translation and translation_targets:
                 trans_start = time.time()
                 texts = [t[0] for t in translation_targets]
-                # Batch-translate uncached texts, serve cached ones instantly
-                global _deepl_hits, _deepl_misses
-                cached_set = _deepl_cache
+                global _trans_hits, _trans_misses
                 translations = [None] * len(texts)
                 uncached_texts = []
                 uncached_indices = []
                 for i, t in enumerate(texts):
-                    if t in cached_set:
-                        _deepl_hits += 1
-                        translations[i] = cached_set[t]
+                    if t in _translation_cache:
+                        _trans_hits += 1
+                        translations[i] = _translation_cache[t]
                     else:
-                        _deepl_misses += 1
+                        _trans_misses += 1
                         uncached_texts.append(t)
                         uncached_indices.append(i)
                 if uncached_texts:
-                    batch_results = translate_deepl_batch(uncached_texts)
+                    if self.translator == "deepl":
+                        batch_results = translate_deepl_batch(uncached_texts)
+                    else:
+                        batch_results = [GoogleTranslator(source='ja', target='en').translate(t) for t in uncached_texts]
                     for t, res in zip(uncached_texts, batch_results):
-                        cached_set[t] = res
+                        if not res.startswith("["):
+                            _translation_cache[t] = res
                     for idx, res in zip(uncached_indices, batch_results):
                         translations[idx] = res
                 for i, trans in enumerate(translations):
@@ -3013,6 +3065,10 @@ def main():
     print("  Ctrl+Alt+Shift+R  Snip mode (drag-select a region)")
     print("  Ctrl+Alt+Shift+S  Settings panel")
     print("  Press Escape while frozen to unfreeze and restore focus.")
+
+    # Prompt for DeepL key on first launch if that translator is selected
+    if app.translator == "deepl":
+        app.root.after(100, app._ensure_deepl_key)
 
     # Start Win32 hotkey thread (RegisterHotKey with fallback to GetAsyncKeyState)
     threading.Thread(target=register_hotkey_win32, args=(app,), daemon=True).start()
