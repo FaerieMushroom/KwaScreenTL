@@ -211,17 +211,53 @@ def translate_deepl(text):
 _translation_cache = {}
 _trans_hits = 0
 _trans_misses = 0
+_TRANSLATION_CACHE_MAX = 1000
+
+def _cache_path(service):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"translation_cache_{service}.json")
+
+def _load_cache(service):
+    global _translation_cache
+    _translation_cache = {}
+    try:
+        with open(_cache_path(service), "r") as f:
+            raw = json.load(f)
+    except Exception:
+        return
+    for k, v in raw.items():
+        if isinstance(v, dict) and "translation" in v:
+            _translation_cache[k] = v
+        else:
+            _translation_cache[k] = {"translation": v, "hits": 0}
+    _cache_trim()
+
+def _save_cache(service):
+    try:
+        with open(_cache_path(service), "w") as f:
+            json.dump(_translation_cache, f, indent=2)
+    except Exception:
+        pass
+
+def _cache_trim():
+    if len(_translation_cache) <= _TRANSLATION_CACHE_MAX:
+        return
+    sorted_items = sorted(_translation_cache.items(), key=lambda x: x[1]["hits"])
+    for k, _ in sorted_items[:len(sorted_items) - _TRANSLATION_CACHE_MAX]:
+        del _translation_cache[k]
 
 def _translate_or_cached(text):
-    """Return cached translation result or translate and cache it."""
+    """Return cached translation result or translate and cache it (DeepL)."""
     global _trans_hits, _trans_misses
     if text in _translation_cache:
         _trans_hits += 1
-        return _translation_cache[text]
+        _translation_cache[text]["hits"] += 1
+        return _translation_cache[text]["translation"]
     _trans_misses += 1
     result = translate_deepl(text)
     if not result.startswith("["):
-        _translation_cache[text] = result
+        _translation_cache[text] = {"translation": result, "hits": 1}
+        _cache_trim()
+        _save_cache("deepl")
     return result
 
 def translate_deepl_batch(texts):
@@ -865,6 +901,7 @@ class ScreenFreezerApp:
         self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
         self._settings_window = None
         self._load_settings()
+        _load_cache(self.translator)
 
         # Pre-warm PaddleOCR in background so first scan doesn't pay model-load cost
         self._prewarm_event = threading.Event()
@@ -1121,11 +1158,13 @@ class ScreenFreezerApp:
         self._translator_var = tk.StringVar(value=self.translator)
         def on_translator_change(*_):
             val = self._translator_var.get()
-            self.translator = val
-            self._save_settings()
-            _translation_cache.clear()
-            if val == "deepl":
-                self._ensure_deepl_key()
+            if val != self.translator:
+                _save_cache(self.translator)
+                self.translator = val
+                _load_cache(val)
+                self._save_settings()
+                if val == "deepl":
+                    self._ensure_deepl_key()
 
         self._translator_var.trace_add("write", on_translator_change)
 
@@ -1170,6 +1209,11 @@ class ScreenFreezerApp:
         tk.Checkbutton(win, text="Show cropped image", variable=self._show_crop_var,
                        command=on_toggle).pack(anchor="w", **pad)
 
+        tk.Label(win, text="", font=("Segoe UI", 3)).pack()  # spacer
+        tk.Button(win, text="Purge translation caches",
+                  command=self._purge_translation_caches,
+                  font=("Segoe UI", 8)).pack(anchor="w", padx=12, pady=3)
+
         win.update_idletasks()
         win.geometry(f"{win.winfo_reqwidth()}x{win.winfo_reqheight()}")
 
@@ -1193,6 +1237,18 @@ class ScreenFreezerApp:
                 import tkinter.messagebox as tkmb
                 tkmb.showerror("Error", f"Failed to save API key:\n{e}", parent=self._settings_window or self.root)
 
+    def _purge_translation_caches(self):
+        for svc in ("deepl", "google"):
+            p = _cache_path(svc)
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        _translation_cache.clear()
+        global _trans_hits, _trans_misses
+        _trans_hits = 0
+        _trans_misses = 0
+
     def _refresh_hover_card(self):
         self._hide_card()
         if self.current_hover_idx >= 0 and self.current_hover_idx < len(self.ocr_boxes):
@@ -1202,14 +1258,25 @@ class ScreenFreezerApp:
         """Re-translate all OCR boxes whose english field is empty."""
         boxes = list(self.ocr_boxes)
         def _do():
+            global _trans_hits, _trans_misses
             for box in boxes:
                 text = box['data'].get('original', '')
                 if text and not box['data'].get('english'):
                     try:
-                        if self.translator == "deepl":
-                            eng = _translate_or_cached(text)
+                        if text in _translation_cache:
+                            _trans_hits += 1
+                            _translation_cache[text]["hits"] += 1
+                            eng = _translation_cache[text]["translation"]
                         else:
-                            eng = GoogleTranslator(source='ja', target='en').translate(text)
+                            _trans_misses += 1
+                            if self.translator == "deepl":
+                                eng = translate_deepl(text)
+                            else:
+                                eng = GoogleTranslator(source='ja', target='en').translate(text)
+                            if not eng.startswith("["):
+                                _translation_cache[text] = {"translation": eng, "hits": 1}
+                                _cache_trim()
+                                _save_cache(self.translator)
                         box['data']['english'] = eng
                     except Exception:
                         pass
@@ -1591,7 +1658,8 @@ class ScreenFreezerApp:
                 for i, t in enumerate(texts):
                     if t in _translation_cache:
                         _trans_hits += 1
-                        translations[i] = _translation_cache[t]
+                        _translation_cache[t]["hits"] += 1
+                        translations[i] = _translation_cache[t]["translation"]
                     else:
                         _trans_misses += 1
                         uncached_texts.append(t)
@@ -1603,7 +1671,9 @@ class ScreenFreezerApp:
                         batch_results = [GoogleTranslator(source='ja', target='en').translate(t) for t in uncached_texts]
                     for t, res in zip(uncached_texts, batch_results):
                         if not res.startswith("["):
-                            _translation_cache[t] = res
+                            _translation_cache[t] = {"translation": res, "hits": 1}
+                    _cache_trim()
+                    _save_cache(self.translator)
                     for idx, res in zip(uncached_indices, batch_results):
                         translations[idx] = res
                 for i, trans in enumerate(translations):

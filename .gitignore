@@ -1,5 +1,7 @@
 deeplapikey.txt
 apikeys.json
+translation_cache_deepl.json
+translation_cache_google.json
 __pycache__/main.cpython-313.pyc
 settings.json
 furigana_overrides.json
