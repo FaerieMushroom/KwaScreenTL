@@ -2074,10 +2074,20 @@ class ScreenFreezerApp:
 
             self.root.after(0, self._dict_lookup_show, word, card_w, seq, mock_res, kanji_data, single_char, pos, conj, hira)
         except Exception:
+            import traceback
+            traceback.print_exc(file=sys.stdout)
             self.root.after(0, self._dict_lookup_skip, seq)
 
     def _dict_lookup_show(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj='', hira=''):
         """Main thread: render dict card from lookup results."""
+        try:
+            self._dict_lookup_show_impl(word, card_w, seq, res, kanji_data, single_char, pos, conj, hira)
+        except Exception:
+            import traceback
+            traceback.print_exc(file=sys.stdout)
+            self._withdraw_dict_card()
+
+    def _dict_lookup_show_impl(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj='', hira=''):
         if seq != self._dict_lookup_seq:
             return
         current = self._get_hovered_single_char() if single_char else self._get_hovered_chunk_dict_form()
@@ -2100,11 +2110,7 @@ class ScreenFreezerApp:
                 user32.SetLayeredWindowAttributes(hwnd, 0, 0xFA, LWA_ALPHA)
             except Exception:
                 pass
-        else:
-            try:
-                self._dict_window.deiconify()
-            except Exception:
-                pass
+        # Keep window withdrawn until geometry is set to avoid flicker.
 
         canvas = self._dict_canvas
         canvas.delete("all")
@@ -2142,6 +2148,8 @@ class ScreenFreezerApp:
             canvas.create_text(pad_x, ly, text=conj, font=pos_font, fill="#8e8e93", anchor="nw")
             ly += pos_h + 2
 
+        self._dict_top_entry = None
+
         # POS boost: only trust it for closed-class / grammatical words where
         # the tag is a reliable disambiguation signal. For broad open-class
         # categories (noun, verb, adjective, adverb …) many unrelated JMdict
@@ -2164,10 +2172,9 @@ class ScreenFreezerApp:
                         preferred_entries.insert(0, preferred_entries.pop(i))
                         break
 
-            top_entry = None
             for idx, entry in enumerate(preferred_entries[:4]):
                 if idx == 0:
-                    top_entry = entry
+                    self._dict_top_entry = entry
                 kanji_texts = [k.text for k in entry.kanji_forms]
                 kana_texts = [k.text for k in entry.kana_forms]
                 header = ""
@@ -2195,10 +2202,10 @@ class ScreenFreezerApp:
                     ly += _nlines(bf, def_text, wrap_w_inner) * body_h + 4
 
         kanji_chars = [c for c in word if _is_kanji(c)]
-        if top_entry is not None:
+        if self._dict_top_entry is not None:
             hovered_chunk = self._get_hovered_chunk_text()
             if hovered_chunk:
-                _log_click_event(self._card_data, hovered_chunk, top_entry=top_entry, candidates=[word] + ([base_form] if base_form != word else []) + ([cw for cw in combined if cw not in candidates and contains_japanese(cw)] if isinstance(combined, list) else []))
+                _log_click_event(self._card_data, hovered_chunk, top_entry=self._dict_top_entry)
 
         if single_char and kanji_chars:
             unique_kanjis = []
@@ -2311,13 +2318,6 @@ class ScreenFreezerApp:
         bbox = canvas.bbox("all")
         dict_h = (bbox[3] if bbox else ly) + 8
 
-        # --- Dict card placement: keep it OUTSIDE the frozen OCR region so
-        # hovering over it doesn't fire a Leave on the OCR box and close itself.
-        #
-        # Strategy:
-        #   1. Try LEFT of the OCR region (overlay_x - card_w - 4).
-        #   2. Fall back to RIGHT of the region (overlay_x + overlay_w + 4).
-        #   3. Vertically: align top to the hovered word row, clamped on screen.
         screen_limit_x = 1920
         screen_limit_y = 1080
         try:
@@ -2326,27 +2326,75 @@ class ScreenFreezerApp:
         except Exception:
             pass
 
-        # Vertical anchor: top of the hovered OCR box row on screen.
-        try:
-            ob = self._card_box.get('orig_bbox', {})
-            word_screen_y = int(self.overlay_y + ob.get('y', 0))
-        except Exception:
-            word_screen_y = self.overlay_y
-        # Prefer to start at the word row, but clamp so card stays on screen.
-        dict_y = max(0, min(word_screen_y, screen_limit_y - dict_h))
+        def _dict_rect_overlaps(cx, cy, cw, ch):
+            cr = (cx, cy, cx + cw, cy + ch)
+            for ob in self.ocr_boxes:
+                obb = ob.get('orig_bbox', {})
+                ox = self.overlay_x + obb.get('x', 0)
+                oy = self.overlay_y + obb.get('y', 0)
+                ow = obb.get('width', 0)
+                oh = obb.get('height', 0)
+                if not (cr[2] <= ox or cr[0] >= ox + ow or cr[3] <= oy or cr[1] >= oy + oh):
+                    return True
+            if self._card_window and self._card_xy:
+                try:
+                    tx, ty = self._card_xy
+                    tw = self._card_window.winfo_width()
+                    th = self._card_window.winfo_height()
+                    if not (cr[2] <= tx or cr[0] >= tx + tw or cr[3] <= ty or cr[1] >= ty + th):
+                        return True
+                except Exception:
+                    pass
+            return False
 
-        # Horizontal: try left side first.
-        left_x = self.overlay_x - card_w - 4
-        right_x = self.overlay_x + self.overlay_w + 4
-        if left_x >= 0:
-            dict_x = left_x
-        elif right_x + card_w <= screen_limit_x:
-            dict_x = right_x
-        else:
-            # Neither side fits cleanly — use left side, clamped to 0.
-            dict_x = max(0, left_x)
+        # Compute left/right bounds from both the translation card and the
+        # hovered OCR region, taking the tighter (leftmost / rightmost) bound
+        # so the bump clears both.
+        bump_left = self.overlay_x
+        bump_right = self.overlay_x + self.overlay_w
+        try:
+            obb = self._card_box.get('orig_bbox', {})
+            bump_left = self.overlay_x + obb.get('x', 0)
+            bump_right = bump_left + obb.get('width', 0)
+        except Exception:
+            pass
+        try:
+            if self._card_window and self._card_xy:
+                tx, ty = self._card_xy
+                tw = self._card_window.winfo_width()
+                bump_left = min(bump_left, tx)
+                bump_right = max(bump_right, tx + tw)
+        except Exception:
+            pass
+
+        # Try positions in order of preference, pick the first that fits
+        # on screen and doesn't collide with OCR boxes or the translation card.
+        candidates = [
+            (self.overlay_x, self.overlay_y + self.overlay_h + 4),
+            (bump_left - card_w - 4, self.overlay_y + self.overlay_h + 4),
+            (bump_right + 4, self.overlay_y + self.overlay_h + 4),
+            (self.overlay_x - card_w - 4, self.overlay_y + self.overlay_h + 4),
+            (self.overlay_x + self.overlay_w + 4, self.overlay_y + self.overlay_h + 4),
+            (self.overlay_x, self.overlay_y),
+            (bump_left - card_w - 4, self.overlay_y),
+            (bump_right + 4, self.overlay_y),
+            (self.overlay_x - card_w - 4, self.overlay_y),
+            (self.overlay_x + self.overlay_w + 4, self.overlay_y),
+            (self.overlay_x, screen_limit_y - dict_h),
+        ]
+        dict_x, dict_y = self.overlay_x, screen_limit_y - dict_h
+        for cand_x, cand_y in candidates:
+            cx = max(0, min(cand_x, screen_limit_x - card_w))
+            cy = max(0, min(cand_y, screen_limit_y - dict_h))
+            if not _dict_rect_overlaps(cx, cy, card_w, dict_h):
+                dict_x, dict_y = cx, cy
+                break
 
         self._dict_window.geometry(f"{card_w}x{dict_h}+{dict_x}+{dict_y}")
+        try:
+            self._dict_window.deiconify()
+        except Exception:
+            pass
         self._dict_window.lift()
         canvas.configure(height=dict_h, width=card_w)
         try:
