@@ -17,6 +17,8 @@ import warnings
 warnings.filterwarnings("ignore", message="No ccache found")
 import sys
 import msvcrt
+from hotkeys import register_hotkey_win32, _hk_display, _vk_to_display, MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_NOREPEAT
+from settings import SettingsManager
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 STD_ERROR_HANDLE = -12
 _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
@@ -944,19 +946,12 @@ class KwaScreenApp:
         self.japanese_font = "Meiryo"
         self.japanese_font_size = 16
         self.font_size_en = 10
-        self._settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-        self._settings_window = None
-        self._recording_action = None
-        self._recording_btn = None
-        self._recording_pending = None
-        self._recording_prev = None
-        self._hk_btns = {}
-        self._hk_suppress_until = 0.0
         self.hk_capture = {"mod": MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, "vk": ord('E'), "display": "Ctrl+Alt+Shift+E"}
         self.hk_snip = {"mod": MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, "vk": ord('R'), "display": "Ctrl+Alt+Shift+R"}
         self.hk_settings = {"mod": MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, "vk": ord('S'), "display": "Ctrl+Alt+Shift+S"}
         self._hk_dirty = threading.Event()
-        self._load_settings()
+        self.settings = SettingsManager(self)
+        self.settings.load()
         _load_cache(self.translator)
 
         # Pre-warm PaddleOCR in background so first scan doesn't pay model-load cost
@@ -1123,7 +1118,7 @@ class KwaScreenApp:
                     if self._card_window and self._card_data_idx >= 0:
                         self._render_card()
                 elif msg_type == "toggle_settings":
-                    self.toggle_settings()
+                    self.settings.toggle()
         except queue.Empty:
             pass
         except Exception:
@@ -1141,184 +1136,19 @@ class KwaScreenApp:
     def trigger_settings(self):
         self.msg_queue.put(("toggle_settings", None))
 
-    def _load_settings(self):
-        try:
-            with open(self._settings_file, "r") as f:
-                data = json.load(f)
-            self.show_crop = data.get("show_crop", True)
-            self.show_romaji = data.get("show_romaji", True)
-            self.skip_non_japanese = data.get("skip_non_japanese", SKIP_NON_JAPANESE)
-            self.show_translation = data.get("show_translation", True)
-            self.translator = data.get("translator", TRANSLATOR)
-            self.region_detect_scale = data.get("region_detect_scale", 100)
-            hk = data.get("hotkeys", {})
-            if "capture" in hk:
-                self.hk_capture = hk["capture"]
-            if "snip" in hk:
-                self.hk_snip = hk["snip"]
-            if "settings" in hk:
-                self.hk_settings = hk["settings"]
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
-
-    def _save_settings(self):
-        data = {
-            "show_crop": self.show_crop,
-            "show_romaji": self.show_romaji,
-            "skip_non_japanese": self.skip_non_japanese,
-            "show_translation": self.show_translation,
-            "translator": self.translator,
-            "region_detect_scale": self.region_detect_scale,
-            "hotkeys": {
-                "capture": self.hk_capture,
-                "snip": self.hk_snip,
-                "settings": self.hk_settings,
-            },
-        }
-        with open(self._settings_file, "w") as f:
-            json.dump(data, f)
-
-    def toggle_settings(self):
-        if self._settings_window and self._settings_window.winfo_exists():
-            self._cancel_recording()
-            self._hk_btns.clear()
-            self._settings_window.destroy()
-            self._settings_window = None
-            return
-        win = tk.Toplevel(self.root)
-        win.title("Settings")
-        win.resizable(False, False)
-        win.attributes("-topmost", True)
-        self._settings_window = win
-
-        self._show_crop_var = tk.BooleanVar(value=self.show_crop)
-        self._show_romaji_var = tk.BooleanVar(value=self.show_romaji)
-        self._skip_nj_var = tk.BooleanVar(value=self.skip_non_japanese)
-        self._show_translation_var = tk.BooleanVar(value=self.show_translation)
-
-        def on_toggle():
-            old_translation = self.show_translation
-            self.show_crop = self._show_crop_var.get()
-            self.show_romaji = self._show_romaji_var.get()
-            self.skip_non_japanese = self._skip_nj_var.get()
-            self.show_translation = self._show_translation_var.get()
-            self._save_settings()
-            if old_translation != self.show_translation:
-                if self.show_translation:
-                    self._retranslate_boxes()
-                else:
-                    for box in self.ocr_boxes:
-                        box['data']['english'] = ""
-                    self._refresh_hover_card()
-            else:
-                self._refresh_hover_card()
-
-        pad = {"padx": 12, "pady": 3}
-        tk.Label(win, text="Hover Card", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        sep = tk.Frame(win, height=1, bg="#c0c0c0")
-        sep.pack(fill="x", padx=12)
-        tk.Checkbutton(win, text="Show romaji", variable=self._show_romaji_var,
-                       command=on_toggle).pack(anchor="w", **pad)
-        tk.Checkbutton(win, text="Show translation", variable=self._show_translation_var,
-                       command=on_toggle).pack(anchor="w", **pad)
-
-        tk.Label(win, text="Translator", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        sep_t = tk.Frame(win, height=1, bg="#c0c0c0")
-        sep_t.pack(fill="x", padx=12)
-
-        self._translator_var = tk.StringVar(value=self.translator)
-        def on_translator_change(*_):
-            val = self._translator_var.get()
-            if val != self.translator:
-                _save_cache(self.translator)
-                self.translator = val
-                _load_cache(val)
-                self._save_settings()
-                if val == "deepl":
-                    self._ensure_deepl_key()
-
-        self._translator_var.trace_add("write", on_translator_change)
-
-        f_trans = tk.Frame(win)
-        f_trans.pack(fill="x", padx=12, pady=3)
-        tk.Label(f_trans, text="Service:", anchor="w", width=20).pack(side="left")
-        tk.OptionMenu(f_trans, self._translator_var, "deepl", "google").pack(side="left")
-
-        tk.Label(win, text="OCR Filter", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        sep2 = tk.Frame(win, height=1, bg="#c0c0c0")
-        sep2.pack(fill="x", padx=12)
-        tk.Checkbutton(win, text="Skip non-Japanese text", variable=self._skip_nj_var,
-                       command=on_toggle).pack(anchor="w", **pad)
-
-        tk.Label(win, text="OCR Scaling", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        sep3 = tk.Frame(win, height=1, bg="#c0c0c0")
-        sep3.pack(fill="x", padx=12)
-
-        opts = {"25%": 25, "50%": 50, "75%": 75, "100%": 100}
-        def opt_label(v): return next(k for k, val in opts.items() if val == v)
-
-        self._region_detect_var = tk.StringVar(value=opt_label(self.region_detect_scale))
-
-        def on_scale_change(*_):
-            val = opts[self._region_detect_var.get()]
-            self.region_detect_scale = val
-            self._save_settings()
-
-        self._region_detect_var.trace_add("write", on_scale_change)
-
-        f1 = tk.Frame(win)
-        f1.pack(fill="x", padx=12, pady=3)
-        tk.Label(f1, text="OCR Prepass Scale:", anchor="w", width=20).pack(side="left")
-        tk.OptionMenu(f1, self._region_detect_var, *opts.keys()).pack(side="left")
-
-        tk.Label(win, text="Hotkeys", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        sep_hk = tk.Frame(win, height=1, bg="#c0c0c0")
-        sep_hk.pack(fill="x", padx=12)
-
-        def make_rec_btn(action, hk):
-            f = tk.Frame(win)
-            f.pack(fill="x", padx=12, pady=2)
-            labels = {"capture": "Capture window:", "snip": "Capture region:", "settings": "Open settings:"}
-            tk.Label(f, text=labels[action], anchor="w", width=20).pack(side="left")
-            btn = tk.Button(f, text=hk["display"], width=20,
-                            command=lambda a=action: self._start_hotkey_recording(a, btn))
-            btn.pack(side="left", padx=(0, 4))
-            tk.Label(f, text="(Esc to reset)", font=("Segoe UI", 7), fg="gray").pack(side="left")
-            self._hk_btns[action] = btn
-
-        make_rec_btn("capture", self.hk_capture)
-        make_rec_btn("snip", self.hk_snip)
-        make_rec_btn("settings", self.hk_settings)
-
-        tk.Label(win, text="Debug", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        sep4 = tk.Frame(win, height=1, bg="#c0c0c0")
-        sep4.pack(fill="x", padx=12)
-        tk.Checkbutton(win, text="Show cropped image", variable=self._show_crop_var,
-                       command=on_toggle).pack(anchor="w", **pad)
-
-        tk.Label(win, text="", font=("Segoe UI", 3)).pack()  # spacer
-        tk.Button(win, text="Purge translation caches",
-                  command=self._purge_translation_caches,
-                  font=("Segoe UI", 8)).pack(anchor="w", padx=12, pady=3)
-
-        win.update_idletasks()
-        win.geometry(f"{win.winfo_reqwidth()}x{win.winfo_reqheight()}")
-
-        win.protocol("WM_DELETE_WINDOW", lambda: (
-            self._cancel_recording(), self._hk_btns.clear(),
-            setattr(self, '_settings_window', None), win.destroy()
-        ))
+    def _switch_translator(self, val):
+        _save_cache(self.translator)
+        self.translator = val
+        _load_cache(val)
+        self.settings.save()
+        if val == "deepl":
+            self._ensure_deepl_key()
 
     def _ensure_deepl_key(self):
         if get_deepl_api_key():
             return
-        key = tksd.askstring("DeepL API Key", "Enter your DeepL API key:", parent=self._settings_window or self.root)
+        parent = self.settings.window or self.root
+        key = tksd.askstring("DeepL API Key", "Enter your DeepL API key:", parent=parent)
         if key:
             key = key.strip()
             try:
@@ -1329,135 +1159,9 @@ class KwaScreenApp:
                 _deepl_api_key = key
             except Exception as e:
                 import tkinter.messagebox as tkmb
-                tkmb.showerror("Error", f"Failed to save API key:\n{e}", parent=self._settings_window or self.root)
+                tkmb.showerror("Error", f"Failed to save API key:\n{e}", parent=parent)
 
-    def _hk_defaults(self):
-        return {
-            "capture": {"mod": MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, "vk": ord('E')},
-            "snip": {"mod": MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, "vk": ord('R')},
-            "settings": {"mod": MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, "vk": ord('S')},
-        }
-
-    def _reset_hk_to_default(self, action):
-        hk = dict(self._hk_defaults()[action])
-        hk["display"] = _hk_display(hk)
-        setattr(self, f"hk_{action}", hk)
-        btn = self._hk_btns.get(action)
-        if btn and btn.winfo_exists():
-            btn.config(text=hk["display"])
-
-    def _start_hotkey_recording(self, action, btn):
-        # Revert previous recording if clicking a different button
-        if self._recording_action and self._recording_action != action and self._recording_prev is not None:
-            setattr(self, f"hk_{self._recording_action}", self._recording_prev)
-            if self._recording_btn and self._recording_btn.winfo_exists():
-                self._recording_btn.config(text=self._recording_prev["display"])
-        self._recording_action = action
-        self._recording_btn = btn
-        self._recording_pending = None
-        self._recording_prev = getattr(self, f"hk_{action}")
-        btn.config(text="…")
-        self.root.after(50, self._poll_recording)
-
-    def _poll_recording(self):
-        if not self._recording_action:
-            return
-
-        is_down = lambda vk: bool(user32.GetAsyncKeyState(vk) & 0x8000)
-
-        if is_down(27):  # Escape → reset to default
-            hk = dict(self._hk_defaults()[self._recording_action])
-            hk["display"] = _hk_display(hk)
-            self._finish_recording(hk)
-            return
-
-        for vk in list(range(0x30, 0x3A)) + list(range(0x41, 0x5B)) + list(range(0x70, 0x7C)):
-            if not is_down(vk):
-                continue
-            if self._recording_pending is not None:
-                break
-
-            ctrl_down = is_down(VK_LCTRL) or is_down(VK_RCTRL)
-            alt_down = is_down(VK_LALT) or is_down(VK_RALT)
-            shift_down = is_down(VK_LSHIFT) or is_down(VK_RSHIFT)
-
-            modifiers = MOD_NOREPEAT
-            mod_parts = []
-            if ctrl_down:
-                modifiers |= MOD_CONTROL
-                mod_parts.append("Ctrl")
-            if alt_down:
-                modifiers |= MOD_ALT
-                mod_parts.append("Alt")
-            if shift_down:
-                modifiers |= MOD_SHIFT
-                mod_parts.append("Shift")
-
-            mod_parts.append(_vk_to_display(vk))
-
-            for other in ("capture", "snip", "settings"):
-                if other == self._recording_action:
-                    continue
-                ohk = getattr(self, f"hk_{other}")
-                if ohk["vk"] == vk and (ohk["mod"] & ~MOD_NOREPEAT) == (modifiers & ~MOD_NOREPEAT):
-                    self._reset_hk_to_default(other)
-                    hk = dict(self._hk_defaults()[self._recording_action])
-                    hk["display"] = _hk_display(hk)
-                    self._reset_hk_to_default(self._recording_action)
-                    self._hk_dirty.set()
-                    self._save_settings()
-                    self._finish_recording(hk)
-                    return
-
-            self._recording_pending = {"mod": modifiers, "vk": vk, "display": "+".join(mod_parts)}
-            break
-
-        if self._recording_pending is not None:
-            hk = self._recording_pending
-            if not is_down(hk["vk"]):
-                mods_down = (is_down(VK_LCTRL) or is_down(VK_RCTRL)
-                             or is_down(VK_LALT) or is_down(VK_RALT)
-                             or is_down(VK_LSHIFT) or is_down(VK_RSHIFT))
-                if not mods_down:
-                    self._finish_recording(hk)
-                    return
-
-        self.root.after(50, self._poll_recording)
-
-    def _finish_recording(self, hk):
-        setattr(self, f"hk_{self._recording_action}", hk)
-        self._recording_btn.config(text=hk["display"])
-        self._recording_action = None
-        self._recording_btn = None
-        self._recording_pending = None
-        self._recording_prev = None
-        self._hk_dirty.set()
-        self._save_settings()
-        self._hk_suppress_until = time.time() + 0.3
-        self._wait_keys_up()
-
-    def _wait_keys_up(self):
-        if time.time() >= self._hk_suppress_until:
-            is_down = lambda vk: bool(user32.GetAsyncKeyState(vk) & 0x8000)
-            still_held = any(
-                is_down(vk) for vk in
-                list(range(0x30, 0x3A)) + list(range(0x41, 0x5B)) + list(range(0x70, 0x7C))
-                + [VK_LCTRL, VK_RCTRL, VK_LALT, VK_RALT, VK_LSHIFT, VK_RSHIFT]
-            )
-            if not still_held:
-                self._hk_suppress_until = 0.0
-                return
-        self.root.after(50, self._wait_keys_up)
-
-    def _cancel_recording(self):
-        if not self._recording_action:
-            return
-        self._recording_action = None
-        self._recording_btn = None
-        self._recording_pending = None
-        self._recording_prev = None
-
-    def _purge_translation_caches(self):
+    def _purge_caches(self):
         for svc in ("deepl", "google"):
             p = _cache_path(svc)
             try:
@@ -3284,142 +2988,7 @@ class KwaScreenApp:
         self.check_focus()
         self.root.mainloop()
 
-# ── Win32 RegisterHotKey (works across elevation & fullscreen) ────────────────
 user32 = ctypes.windll.user32
-WM_HOTKEY = 0x0312
-MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
-MOD_SHIFT = 0x0004
-MOD_NOREPEAT = 0x4000
-VK_LCTRL = 0xA2
-VK_RCTRL = 0xA3
-VK_LALT = 0xA4
-VK_RALT = 0xA5
-VK_LSHIFT = 0xA0
-VK_RSHIFT = 0xA1
-
-HK_CAPTURE  = 1
-HK_SNIP     = 2
-HK_SETTINGS = 3
-
-def _mods_from_hk(hk):
-    return hk["mod"] & ~MOD_NOREPEAT | MOD_NOREPEAT
-
-_VK_MODS = {
-    VK_LCTRL: "Ctrl", VK_RCTRL: "Ctrl",
-    VK_LALT: "Alt", VK_RALT: "Alt",
-    VK_LSHIFT: "Shift", VK_RSHIFT: "Shift",
-}
-
-def _vk_to_display(vk):
-    if 0x30 <= vk <= 0x39:
-        return chr(vk)
-    if 0x41 <= vk <= 0x5A:
-        return chr(vk)
-    if 0x70 <= vk <= 0x7B:
-        return f"F{vk - 0x6F}"
-    return f"VK_{vk}"
-
-def _hk_display(hk):
-    parts = []
-    m = hk["mod"]
-    if m & MOD_CONTROL: parts.append("Ctrl")
-    if m & MOD_ALT: parts.append("Alt")
-    if m & MOD_SHIFT: parts.append("Shift")
-    parts.append(_vk_to_display(hk["vk"]))
-    return "+".join(parts)
-
-def register_hotkey_win32(app):
-    msg = ctypes.wintypes.MSG()
-    user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
-
-    def do_register():
-        user32.UnregisterHotKey(None, HK_CAPTURE)
-        user32.UnregisterHotKey(None, HK_SNIP)
-        user32.UnregisterHotKey(None, HK_SETTINGS)
-        hk = app.hk_capture
-        user32.RegisterHotKey(None, HK_CAPTURE, _mods_from_hk(hk), hk["vk"])
-        hk = app.hk_snip
-        user32.RegisterHotKey(None, HK_SNIP, _mods_from_hk(hk), hk["vk"])
-        hk = app.hk_settings
-        user32.RegisterHotKey(None, HK_SETTINGS, _mods_from_hk(hk), hk["vk"])
-
-    do_register()
-
-    def is_key_down(vk):
-        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
-
-    pressed_flag = 0
-    while True:
-        suppress = (app._recording_action is not None
-                    or time.time() < app._hk_suppress_until)
-        while user32.PeekMessageW(ctypes.byref(msg), None, WM_HOTKEY, WM_HOTKEY, 1):
-            if suppress:
-                continue
-            if msg.wParam == HK_CAPTURE:
-                pressed_flag |= 1
-                app.trigger()
-            elif msg.wParam == HK_SNIP:
-                pressed_flag |= 2
-                app.trigger_snip()
-            elif msg.wParam == HK_SETTINGS:
-                pressed_flag |= 4
-                app.trigger_settings()
-
-        if app._hk_dirty.is_set():
-            do_register()
-            app._hk_dirty.clear()
-
-        if suppress:
-            pressed_flag = 0
-            time.sleep(0.05)
-            continue
-
-        ctrl_down = is_key_down(VK_LCTRL) or is_key_down(VK_RCTRL)
-        alt_down = is_key_down(VK_LALT) or is_key_down(VK_RALT)
-        shift_down = is_key_down(VK_LSHIFT) or is_key_down(VK_RSHIFT)
-
-        def mods_match(hk):
-            m = hk["mod"]
-            if m & MOD_CONTROL:
-                if not ctrl_down: return False
-            elif ctrl_down:
-                return False
-            if m & MOD_ALT:
-                if not alt_down: return False
-            elif alt_down:
-                return False
-            if m & MOD_SHIFT:
-                if not shift_down: return False
-            elif shift_down:
-                return False
-            return True
-
-        hk = app.hk_capture
-        if mods_match(hk) and is_key_down(hk["vk"]):
-            if not (pressed_flag & 1):
-                pressed_flag |= 1
-                app.trigger()
-        else:
-            pressed_flag &= ~1
-
-        hk = app.hk_snip
-        if mods_match(hk) and is_key_down(hk["vk"]):
-            if not (pressed_flag & 2):
-                pressed_flag |= 2
-                app.trigger_snip()
-        else:
-            pressed_flag &= ~2
-
-        hk = app.hk_settings
-        if mods_match(hk) and is_key_down(hk["vk"]):
-            if not (pressed_flag & 4):
-                pressed_flag |= 4
-                app.trigger_settings()
-        else:
-            pressed_flag &= ~4
-
-        time.sleep(0.05)
 
 def main():
     print("Application started")
