@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -58,6 +58,8 @@ namespace KwaScreenTL_Launcher
 
         private async void OnLoaded(object sender, RoutedEventArgs e)
         {
+            KillRunningInstances();
+
             var pythonw = Path.Combine(_projectDir, ".venv", "Scripts", "pythonw.exe");
             if (!File.Exists(pythonw))
             {
@@ -225,6 +227,37 @@ namespace KwaScreenTL_Launcher
             try { _pythonProcess?.WaitForExit(2000); } catch { }
             _pythonProcess?.Dispose();
             _pythonProcess = null;
+        }
+
+        private void KillRunningInstances()
+        {
+            var currentProcess = Process.GetCurrentProcess();
+            var runningLaunchers = Process.GetProcessesByName("Launcher");
+            foreach (var p in runningLaunchers)
+            {
+                if (p.Id != currentProcess.Id)
+                {
+                    try
+                    {
+                        p.Kill(true);
+                    }
+                    catch { }
+                }
+            }
+
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-NoProfile -Command \"Get-Process pythonw -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*KwaScreenTL*' } | Stop-Process -Force\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                using var proc = Process.Start(psi);
+                proc?.WaitForExit(3000);
+            }
+            catch { }
         }
 
         private void ShowError(string message)
