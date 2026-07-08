@@ -881,7 +881,7 @@ def _append_ocr_line(lines, text, x1, y1, x2, y2, vertical):
     lines.append({'text': text, 'words': words})
 
 
-class ScreenFreezerApp:
+class KwaScreenApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
@@ -1033,10 +1033,10 @@ class ScreenFreezerApp:
                 msg_type, data = self.msg_queue.get_nowait()
                 if msg_type == "trigger":
                     if self.active:
-                        self.unfreeze_screen()
+                        self.release_capture()
                     else:
                         try:
-                            self.freeze_screen()
+                            self.capture_window()
                         except Exception:
                             import traceback
                             traceback.print_exc(file=sys.stdout)
@@ -1311,9 +1311,9 @@ class ScreenFreezerApp:
             self.root.after(0, self._refresh_hover_card)
         threading.Thread(target=_do, daemon=True).start()
 
-    def freeze_screen(self):
+    def capture_window(self):
         if self.active:
-            self.unfreeze_screen()
+            self.release_capture()
             return
 
         # Capture currently active window handle + its screen bounds
@@ -1388,11 +1388,11 @@ class ScreenFreezerApp:
             daemon=True
         ).start()
 
-    # ── Snip mode (drag-select region, Ctrl+Alt+Shift+R) ────────────────────
+    # ── Snip Capture (drag-select region, Ctrl+Alt+Shift+R) ─────────────────
 
     def enter_snip_mode(self):
         if self.active:
-            self.unfreeze_screen()
+            self.release_capture()
         self._prev_focus_hwnd = user32.GetForegroundWindow()
         # Force focus back to game window now so subsequent focus polls keep boxes visible
         if self._prev_focus_hwnd:
@@ -1475,10 +1475,10 @@ class ScreenFreezerApp:
         screen_rect = (ml + x1, mt + y1, ml + x2, mt + y2)
         self._close_snip()
 
-        self.freeze_screen_region(screen_rect, ml, mt)
+        self.capture_snip_region(screen_rect, ml, mt)
 
-    def freeze_screen_region(self, screen_rect, mx_off=0, my_off=0):
-        """Freeze a user-selected region (screen coords: left, top, right, bottom)."""
+    def capture_snip_region(self, screen_rect, mx_off=0, my_off=0):
+        """Capture a user-selected region (screen coords: left, top, right, bottom)."""
         left, top, right, bottom = screen_rect
         w, h = right - left, bottom - top
 
@@ -1811,7 +1811,7 @@ class ScreenFreezerApp:
                     pass
 
         # Escape on the box window itself
-            win.bind("<Escape>", lambda e: self.unfreeze_screen())
+            win.bind("<Escape>", lambda e: self.release_capture())
             win.bind("<KeyPress-Control_L>", lambda e: self._on_ctrl_key(True))
             win.bind("<KeyPress-Control_R>", lambda e: self._on_ctrl_key(True))
             win.bind("<KeyRelease-Control_L>", lambda e: self._on_ctrl_key(False))
@@ -2254,7 +2254,7 @@ class ScreenFreezerApp:
             self._dict_window.attributes("-topmost", True)
             self._dict_canvas = tk.Canvas(self._dict_window, borderwidth=0, highlightthickness=0, bg=CARD_BG)
             self._dict_canvas.pack(fill="both", expand=True)
-            self._dict_window.bind("<Escape>", lambda e: self.unfreeze_screen())
+            self._dict_window.bind("<Escape>", lambda e: self.release_capture())
             try:
                 self._dict_window.update_idletasks()
                 hwnd = user32.GetAncestor(self._dict_window.winfo_id(), 2)
@@ -2707,7 +2707,7 @@ class ScreenFreezerApp:
         canvas = tk.Canvas(win, width=card_w, height=card_h,
                            borderwidth=0, highlightthickness=0, bg=CARD_BG)
         canvas.pack()
-        win.bind("<Escape>", lambda e: self.unfreeze_screen())
+        win.bind("<Escape>", lambda e: self.release_capture())
 
         canvas.bind("<Leave>", self._card_leave)
 
@@ -2990,7 +2990,7 @@ class ScreenFreezerApp:
             except Exception:
                 pass
 
-    def unfreeze_screen(self):
+    def release_capture(self):
         if not self.active:
             return
         self.active = False
@@ -3171,7 +3171,7 @@ def main():
     print("Application started")
     print("Loading OCR Model...\n")
 
-    app = ScreenFreezerApp()
+    app = KwaScreenApp()
     app._prewarm_event.wait()
     print("Application Ready\n")
     print("  Ctrl+Alt+Shift+E  Capture / Uncapture window for OCR / translation")
