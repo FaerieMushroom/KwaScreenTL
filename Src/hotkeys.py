@@ -111,28 +111,4 @@ def register_hotkey_win32(app):
                 return False
             return True
 
-        hk = app.hk_capture
-        if mods_match(hk) and is_key_down(hk["vk"]):
-            if not (pressed_flag & 1):
-                pressed_flag |= 1
-                app.trigger()
-        else:
-            pressed_flag &= ~1
-
-        hk = app.hk_snip
-        if mods_match(hk) and is_key_down(hk["vk"]):
-            if not (pressed_flag & 2):
-                pressed_flag |= 2
-                app.trigger_snip()
-        else:
-            pressed_flag &= ~2
-
-        hk = app.hk_settings
-        if mods_match(hk) and is_key_down(hk["vk"]):
-            if not (pressed_flag & 4):
-                pressed_flag |= 4
-                app.trigger_settings()
-        else:
-            pressed_flag &= ~4
-
         time.sleep(0.05)
