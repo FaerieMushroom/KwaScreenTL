@@ -11,7 +11,7 @@ Download the following dictionaries and extract their ZIP files into `KwaScreenT
    - **Extracted Folder Name**: `[JA-JA] 三省堂国語辞典　第八版` (should contain `index.json`, `term_bank_*.json`, etc.)
 
 2. **06 [JA-JA] 漢検漢字辞典　第二版**
-   - **Download Link**: [Google Drive Folder](https://drive.google.com/drive/folders/16frMMOiqCtO-1cscRdjxuO5gUn_GmqVe)
+   - **Download Link**: [Google Drive](https://drive.google.com/file/d/160r5D1PbuFH3DKWHDahbELonycbgAdMF/view?usp=sharing)
    - **Extracted Folder Name**: `06 [JA-JA] 漢検漢字辞典　第二版` (should contain `index.json`, `term_bank_*.json`, etc.)
 
 ### Alternative Sources
@@ -34,11 +34,7 @@ KwaScreenTLMonolingual/
 │       ├── index.json
 │       ├── term_bank_1.json
 │       └── ...
-├── Src/
-│   ├── convert_dict.py
-│   └── convert_kanjidict.py
 ├── convert_dicts.bat
-├── jamdict.db
 └── README.md
 ```
 
