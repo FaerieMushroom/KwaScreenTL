@@ -35,6 +35,8 @@ class SettingsManager:
                 data = json.load(f)
             a = self.app
             a.show_crop = data.get("show_crop", True)
+            a.show_ocr_text = data.get("show_ocr_text", True)
+            a.show_furigana = data.get("show_furigana", True)
             a.show_romaji = data.get("show_romaji", True)
             a.skip_non_japanese = data.get("skip_non_japanese", a.skip_non_japanese)
             a.show_translation = data.get("show_translation", True)
@@ -55,6 +57,8 @@ class SettingsManager:
         a = self.app
         data = {
             "show_crop": a.show_crop,
+            "show_ocr_text": a.show_ocr_text,
+            "show_furigana": a.show_furigana,
             "show_romaji": a.show_romaji,
             "skip_non_japanese": a.skip_non_japanese,
                 "show_translation": a.show_translation,
@@ -100,6 +104,8 @@ class SettingsManager:
         a = self.app
 
         self._show_crop_var = tk.BooleanVar(value=a.show_crop)
+        self._show_ocr_var = tk.BooleanVar(value=a.show_ocr_text)
+        self._show_furigana_var = tk.BooleanVar(value=a.show_furigana)
         self._show_romaji_var = tk.BooleanVar(value=a.show_romaji)
         self._skip_nj_var = tk.BooleanVar(value=a.skip_non_japanese)
         self._show_translation_var = tk.BooleanVar(value=a.show_translation)
@@ -107,6 +113,12 @@ class SettingsManager:
         def on_toggle():
             old_translation = a.show_translation
             a.show_crop = self._show_crop_var.get()
+            a.show_ocr_text = self._show_ocr_var.get()
+            
+            if not a.show_ocr_text:
+                self._show_furigana_var.set(False)
+            
+            a.show_furigana = self._show_furigana_var.get()
             a.show_romaji = self._show_romaji_var.get()
             a.skip_non_japanese = self._skip_nj_var.get()
             
@@ -132,13 +144,18 @@ class SettingsManager:
         pad = {"padx": 12, "pady": 3}
 
         tk.Label(win, text="Hover Card", font=("Segoe UI", 9, "bold"),
-                 anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+                  anchor="w").pack(fill="x", padx=12, pady=(10, 2))
         sep = tk.Frame(win, height=1, bg="#c0c0c0")
         sep.pack(fill="x", padx=12)
+        tk.Checkbutton(win, text="Show OCR text", variable=self._show_ocr_var,
+                       command=on_toggle).pack(anchor="w", **pad)
+        tk.Checkbutton(win, text="Show furigana", variable=self._show_furigana_var,
+                       command=on_toggle).pack(anchor="w", **pad)
         tk.Checkbutton(win, text="Show romaji", variable=self._show_romaji_var,
                        command=on_toggle).pack(anchor="w", **pad)
         tk.Checkbutton(win, text="Show translation", variable=self._show_translation_var,
                        command=on_toggle).pack(anchor="w", **pad)
+
 
         tk.Label(win, text="Translation & Dictionary", font=("Segoe UI", 9, "bold"),
                  anchor="w").pack(fill="x", padx=12, pady=(10, 2))

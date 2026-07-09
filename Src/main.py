@@ -1115,6 +1115,8 @@ class KwaScreenApp:
         self.translator = TRANSLATOR
         self.dictionary_type = "English"
         self.region_detect_scale = 100
+        self.show_ocr_text = True
+        self.show_furigana = True
         self.japanese_font = "Meiryo"
         self.japanese_font_size = 16
         self.font_size_en = 10
@@ -2941,6 +2943,14 @@ class KwaScreenApp:
         """Display the translation card as a separate Toplevel near the hovered box."""
         if idx < 0 or idx >= len(self.ocr_boxes):
             return
+
+        if not (self.show_crop or self.show_ocr_text or self.show_furigana or 
+                self.show_romaji or self.show_translation):
+            if self._card_window:
+                self._card_window.destroy()
+                self._card_window = None
+            return
+
         self._card_data_idx = idx
         self._card_data = self.ocr_boxes[idx]['data']
         self._card_box = self.ocr_boxes[idx]
@@ -2995,10 +3005,12 @@ class KwaScreenApp:
         else:
             content_h += 8
         line_h = max(30, kf.metrics("linespace"))
-        content_h += line_h  # Japanese text
+        if self.show_ocr_text:
+            content_h += line_h  # Japanese text
         furigana_size = max(8, self.japanese_font_size // 2 - 1)
         ff_temp = tkfont.Font(family=self.japanese_font, size=furigana_size)
-        content_h += ff_temp.metrics("linespace") + 2  # furigana + gap
+        if self.show_furigana:
+            content_h += ff_temp.metrics("linespace") + 2  # furigana + gap
         if self.show_romaji:
             content_h += 18 + 2
         if self.show_translation:
@@ -3058,13 +3070,17 @@ class KwaScreenApp:
             ly += 3 + box['crop_pil'].height + 24
         else:
             ly += 8
-
+        
         # Japanese text line
-        jp_y = ly
-        canvas.create_text(pad_x, jp_y, text=data['original'],
-                           font=(self.japanese_font, self.japanese_font_size, "bold"),
-                           fill="#a31515", anchor="nw", tags="jp_text")
-        jp_text_bottom = jp_y + line_h
+        if self.show_ocr_text:
+            jp_y = ly
+            canvas.create_text(pad_x, jp_y, text=data['original'],
+                               font=(self.japanese_font, self.japanese_font_size, "bold"),
+                               fill="#a31515", anchor="nw", tags="jp_text")
+            jp_text_bottom = jp_y + line_h
+        else:
+            jp_text_bottom = ly
+
 
         # Token position tracking for hover highlight
         ki = data.get('kakasi_items', [])
@@ -3084,7 +3100,7 @@ class KwaScreenApp:
             x_end = pad_x + prefix_w + group_w
             self._card_token_positions.append((x_start, x_end, item_idx))
 
-            # Track romaji positions with italic font for accurate highlight
+# Track romaji positions with italic font for accurate highlight
             if self.show_romaji and rf:
                 rt = item.get('hepburn', '') or orig
                 rw = rf.measure(rt)
@@ -3094,7 +3110,7 @@ class KwaScreenApp:
                     rfx += rf.measure(' ')
 
             # Draw furigana for kanji tokens
-            if orig != hira and any(_is_kanji(c) for c in orig):
+            if self.show_furigana and orig != hira and any(_is_kanji(c) for c in orig):
                 okuri_count = 0
                 for ch in reversed(orig):
                     if _is_kana(ch):
@@ -3112,8 +3128,12 @@ class KwaScreenApp:
                     cx = pad_x + prefix_w + kw / 2
                     canvas.create_text(cx, fg_y + 2, text=k_hira, font=ff,
                                        fill="#248a3d", anchor="n", tags="furigana")
+
             char_off += len(orig)
-        ly = fg_y + fg_line_h + 2
+        if self.show_furigana:
+            ly = fg_y + fg_line_h + 2
+        else:
+            ly = fg_y
 
         # Romaji
         rom_y = ly
