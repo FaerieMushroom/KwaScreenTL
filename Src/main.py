@@ -2450,6 +2450,67 @@ class KwaScreenApp:
             traceback.print_exc(file=sys.stdout)
             self._withdraw_dict_card()
 
+    def _compute_card_position(self, card_w, card_h, bump_left, bump_right):
+        """Return (x, y) for a card that doesn't overlap OCR boxes or the hover card."""
+        try:
+            v_left = user32.GetSystemMetrics(76)
+            v_top = user32.GetSystemMetrics(77)
+            v_right = v_left + user32.GetSystemMetrics(78)
+            v_bottom = v_top + user32.GetSystemMetrics(79)
+        except Exception:
+            v_left, v_top, v_right, v_bottom = 0, 0, 1920, 1080
+
+        def _overlaps(cx, cy, cw, ch):
+            cr = (cx, cy, cx + cw, cy + ch)
+            for ob in self.ocr_boxes:
+                obb = ob.get('orig_bbox', {})
+                ox = self.overlay_x + obb.get('x', 0)
+                oy = self.overlay_y + obb.get('y', 0)
+                ow = obb.get('width', 0)
+                oh = obb.get('height', 0)
+                if not (cr[2] <= ox or cr[0] >= ox + ow or cr[3] <= oy or cr[1] >= oy + oh):
+                    return True
+            if self._card_window and self._card_xy:
+                try:
+                    tx, ty = self._card_xy
+                    tw = self._card_window.winfo_width()
+                    th = self._card_window.winfo_height()
+                    if not (cr[2] <= tx or cr[0] >= tx + tw or cr[3] <= ty or cr[1] >= ty + th):
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        try:
+            if self._card_window and self._card_xy:
+                tx, ty = self._card_xy
+                tw = self._card_window.winfo_width()
+                bump_left = min(bump_left, tx)
+                bump_right = max(bump_right, tx + tw)
+        except Exception:
+            pass
+
+        candidates = [
+            (self.overlay_x, self.overlay_y + self.overlay_h + 4),
+            (bump_left - card_w - 4, self.overlay_y + self.overlay_h + 4),
+            (bump_right + 4, self.overlay_y + self.overlay_h + 4),
+            (self.overlay_x - card_w - 4, self.overlay_y + self.overlay_h + 4),
+            (self.overlay_x + self.overlay_w + 4, self.overlay_y + self.overlay_h + 4),
+            (self.overlay_x, self.overlay_y),
+            (bump_left - card_w - 4, self.overlay_y),
+            (bump_right + 4, self.overlay_y),
+            (self.overlay_x - card_w - 4, self.overlay_y),
+            (self.overlay_x + self.overlay_w + 4, self.overlay_y),
+            (self.overlay_x, v_bottom - card_h),
+        ]
+        fallback_x, fallback_y = self.overlay_x, v_bottom - card_h
+        for cand_x, cand_y in candidates:
+            cx = max(v_left, min(cand_x, v_right - card_w))
+            cy = max(v_top, min(cand_y, v_bottom - card_h))
+            if not _overlaps(cx, cy, card_w, card_h):
+                return cx, cy
+        return fallback_x, fallback_y
+
     def _dict_lookup_show_impl(self, word, card_w, seq, res, kanji_data, single_char=False, pos='', conj='', hira=''):
         if seq != self._dict_lookup_seq:
             return
@@ -2785,38 +2846,6 @@ class KwaScreenApp:
         if single_char:
             card_w = min(card_w, max(pad_x + 6 + wrap_w_inner + 4, 180))
 
-        try:
-            v_left = user32.GetSystemMetrics(76)
-            v_top = user32.GetSystemMetrics(77)
-            v_right = v_left + user32.GetSystemMetrics(78)
-            v_bottom = v_top + user32.GetSystemMetrics(79)
-        except Exception:
-            v_left, v_top, v_right, v_bottom = 0, 0, 1920, 1080
-
-        def _dict_rect_overlaps(cx, cy, cw, ch):
-            cr = (cx, cy, cx + cw, cy + ch)
-            for ob in self.ocr_boxes:
-                obb = ob.get('orig_bbox', {})
-                ox = self.overlay_x + obb.get('x', 0)
-                oy = self.overlay_y + obb.get('y', 0)
-                ow = obb.get('width', 0)
-                oh = obb.get('height', 0)
-                if not (cr[2] <= ox or cr[0] >= ox + ow or cr[3] <= oy or cr[1] >= oy + oh):
-                    return True
-            if self._card_window and self._card_xy:
-                try:
-                    tx, ty = self._card_xy
-                    tw = self._card_window.winfo_width()
-                    th = self._card_window.winfo_height()
-                    if not (cr[2] <= tx or cr[0] >= tx + tw or cr[3] <= ty or cr[1] >= ty + th):
-                        return True
-                except Exception:
-                    pass
-            return False
-
-        # Compute left/right bounds from both the translation card and the
-        # hovered OCR region, taking the tighter (leftmost / rightmost) bound
-        # so the bump clears both.
         bump_left = self.overlay_x
         bump_right = self.overlay_x + self.overlay_w
         try:
@@ -2825,37 +2854,7 @@ class KwaScreenApp:
             bump_right = bump_left + obb.get('width', 0)
         except Exception:
             pass
-        try:
-            if self._card_window and self._card_xy:
-                tx, ty = self._card_xy
-                tw = self._card_window.winfo_width()
-                bump_left = min(bump_left, tx)
-                bump_right = max(bump_right, tx + tw)
-        except Exception:
-            pass
-
-        # Try positions in order of preference, pick the first that fits
-        # on screen and doesn't collide with OCR boxes or the translation card.
-        candidates = [
-            (self.overlay_x, self.overlay_y + self.overlay_h + 4),
-            (bump_left - card_w - 4, self.overlay_y + self.overlay_h + 4),
-            (bump_right + 4, self.overlay_y + self.overlay_h + 4),
-            (self.overlay_x - card_w - 4, self.overlay_y + self.overlay_h + 4),
-            (self.overlay_x + self.overlay_w + 4, self.overlay_y + self.overlay_h + 4),
-            (self.overlay_x, self.overlay_y),
-            (bump_left - card_w - 4, self.overlay_y),
-            (bump_right + 4, self.overlay_y),
-            (self.overlay_x - card_w - 4, self.overlay_y),
-            (self.overlay_x + self.overlay_w + 4, self.overlay_y),
-            (self.overlay_x, v_bottom - dict_h),
-        ]
-        dict_x, dict_y = self.overlay_x, v_bottom - dict_h
-        for cand_x, cand_y in candidates:
-            cx = max(v_left, min(cand_x, v_right - card_w))
-            cy = max(v_top, min(cand_y, v_bottom - dict_h))
-            if not _dict_rect_overlaps(cx, cy, card_w, dict_h):
-                dict_x, dict_y = cx, cy
-                break
+        dict_x, dict_y = self._compute_card_position(card_w, dict_h, bump_left, bump_right)
 
         self._dict_window.geometry(f"{card_w}x{dict_h}+{dict_x}+{dict_y}")
         try:
@@ -2870,6 +2869,7 @@ class KwaScreenApp:
             self._apply_round_corners(hwnd, card_w, dict_h)
         except Exception:
             pass
+        self._dict_window.bind("<Escape>", lambda e: self.release_capture())
 
     def _dict_lookup_skip(self, seq):
         """Main thread: skip dict card (no useful results)."""
@@ -2894,6 +2894,84 @@ class KwaScreenApp:
             self._dict_window = None
             self._dict_canvas = None
 
+    def _show_selected_translation_card(self, text, box_idx):
+        """Show a dictionary-style card with translation of the selected text."""
+        if not text:
+            return
+        box = self.ocr_boxes[box_idx] if (0 <= box_idx < len(self.ocr_boxes)) else None
+        if not box:
+            return
+
+        self._hide_dict_card()
+
+        if self.translator == "deepl":
+            english = _translate_or_cached(text)
+        else:
+            try:
+                english = GoogleTranslator(source='ja', target='en').translate(text)
+            except Exception as e:
+                english = f"[Translation error: {e}]"
+
+        card_w = max(box.get('w', 200), 200, 340)
+
+        if not hasattr(self, '_dict_window') or not self._dict_window:
+            self._dict_window = tk.Toplevel(self.root)
+            self._dict_window.overrideredirect(True)
+            self._dict_window.attributes("-topmost", True)
+            self._dict_canvas = tk.Canvas(self._dict_window, borderwidth=0, highlightthickness=0, bg=CARD_BG)
+            self._dict_canvas.pack(fill="both", expand=True)
+            try:
+                self._dict_window.update_idletasks()
+                hwnd = user32.GetAncestor(self._dict_window.winfo_id(), 2)
+                ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+                user32.SetLayeredWindowAttributes(hwnd, 0, 0xFA, LWA_ALPHA)
+            except Exception:
+                pass
+
+        canvas = self._dict_canvas
+        canvas.delete("all")
+
+        title_font_spec = (self.japanese_font, 11, "bold")
+        body_font_spec = ("Segoe UI", 10)
+        tf = tkfont.Font(font=title_font_spec)
+        bf = tkfont.Font(font=body_font_spec)
+        title_h = tf.metrics("linespace")
+        body_h = bf.metrics("linespace")
+
+        pad_x = 8
+        wrap_w = max(card_w - 16, 180)
+        ly = 6
+
+        canvas.create_text(pad_x, ly, text=text, font=title_font_spec,
+                           fill="#a31515", anchor="nw", width=wrap_w)
+        ly += _nlines(tf, text, wrap_w) * title_h + 4
+
+        canvas.create_text(pad_x, ly, text=english, font=body_font_spec,
+                           fill="#1c1c1e", anchor="nw", width=wrap_w)
+        ly += _nlines(bf, english, wrap_w) * body_h + 6
+
+        dict_h = ly
+
+        dict_x, dict_y = self._compute_card_position(card_w, dict_h, self.overlay_x, self.overlay_x + self.overlay_w)
+
+        self._dict_window.geometry(f"{card_w}x{dict_h}+{dict_x}+{dict_y}")
+        try:
+            self._dict_window.deiconify()
+        except Exception:
+            pass
+        self._dict_window.lift()
+        canvas.configure(height=dict_h, width=card_w)
+        try:
+            self._dict_window.update_idletasks()
+            hwnd = user32.GetAncestor(self._dict_window.winfo_id(), 2)
+            self._apply_round_corners(hwnd, card_w, dict_h)
+        except Exception:
+            pass
+
+        self._dict_window.bind("<Escape>", lambda e: self._withdraw_dict_card())
+        canvas.bind("<Button-1>", lambda e: self._withdraw_dict_card())
+
     def _get_action_text(self, idx):
         """Return selected text, or hovered chunk text, or None."""
         text = self._get_selected_text()
@@ -2908,9 +2986,15 @@ class KwaScreenApp:
         return None
 
     def _box_right_click(self, event, idx):
-        """Right-click on a box → single-character kanji lookup."""
+        """Right-click on a box → translate selected text, or single-char kanji lookup."""
         if idx < 0 or idx >= len(self.ocr_boxes):
             return
+
+        selected_text = self._get_selected_text()
+        if selected_text and contains_japanese(selected_text):
+            self._show_selected_translation_card(selected_text, self._selection_box_idx)
+            return
+
         box = self.ocr_boxes[idx]
         bbox = box['orig_bbox']
         words = box.get('words', [])
