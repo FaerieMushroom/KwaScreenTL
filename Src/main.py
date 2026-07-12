@@ -2097,6 +2097,61 @@ class KwaScreenApp:
         self._dict_window.update_idletasks()
         make_translucent(self._dict_window.winfo_id(), 0xFA)
 
+    def _show_dict_searching_placeholder(self, word, card_w):
+        """Show a 'Searching...' placeholder in the dict card while lookup runs."""
+        self._ensure_dict_window()
+
+        canvas = self._dict_canvas
+        canvas.delete("all")
+
+        title_font = (self.japanese_font, 11, "bold")
+        body_font = ("Segoe UI", 10)
+        tf = tkfont.Font(font=title_font)
+        bf = tkfont.Font(font=body_font)
+        title_h = tf.metrics("linespace")
+        body_h = bf.metrics("linespace")
+
+        pad_x = 8
+        wrap_w = max(card_w - 16, 180)
+        ly = 6
+
+        canvas.create_text(pad_x, ly, text=word, font=title_font,
+                           fill="#8e8e93", anchor="nw", width=wrap_w)
+        ly += _nlines(tf, word, wrap_w) * title_h + 4
+
+        canvas.create_text(pad_x, ly, text="Searching\u2026", font=body_font,
+                           fill="#8e8e93", anchor="nw", width=wrap_w)
+        ly += body_h + 4
+
+        canvas.update_idletasks()
+        bbox = canvas.bbox("all")
+        dict_h = (bbox[3] if bbox else ly) + 8
+
+        bump_left = self.overlay_x
+        bump_right = self.overlay_x + self.overlay_w
+        try:
+            obb = self._card_box.get('orig_bbox', {})
+            bump_left = self.overlay_x + obb.get('x', 0)
+            bump_right = bump_left + obb.get('width', 0)
+        except Exception:
+            pass
+        dict_x, dict_y = self._compute_card_position(card_w, dict_h, bump_left, bump_right)
+
+        self._dict_window.geometry(f"{card_w}x{dict_h}+{dict_x}+{dict_y}")
+        try:
+            self._dict_window.deiconify()
+        except Exception:
+            pass
+        self._dict_window.lift()
+        canvas.configure(height=dict_h, width=card_w)
+        try:
+            self._dict_window.update_idletasks()
+            hwnd = user32.GetAncestor(self._dict_window.winfo_id(), 2)
+            self._apply_round_corners(hwnd, card_w, dict_h)
+        except Exception:
+            pass
+        self._dict_window.bind("<Escape>", lambda e: self.release_capture())
+
     def _update_dict_card(self, single_char=False):
         """Start async dictionary lookup for the hovered word."""
         if self._card_hover_char_idx < 0 or not self._card_box:
@@ -2121,6 +2176,7 @@ class KwaScreenApp:
         self._dict_lookup_seq += 1
         seq = self._dict_lookup_seq
         self._withdraw_dict_card()
+        self._show_dict_searching_placeholder(word, card_w)
 
         import threading
         t = threading.Thread(target=self._dict_lookup_thread, args=(word, card_w, seq, single_char, pos, combined, conj, hira), daemon=True)
@@ -2137,6 +2193,7 @@ class KwaScreenApp:
         self._dict_lookup_seq += 1
         seq = self._dict_lookup_seq
         self._withdraw_dict_card()
+        self._show_dict_searching_placeholder(word, card_w)
         single_char = len(word) == 1 and _is_kanji(word)
         import threading
         t = threading.Thread(
