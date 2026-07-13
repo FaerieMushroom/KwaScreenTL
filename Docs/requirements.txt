@@ -11,3 +11,4 @@ requests
 numpy
 paddleocr
 onnxruntime
+customtkinter

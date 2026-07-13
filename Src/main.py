@@ -990,6 +990,8 @@ class KwaScreenApp:
         self.translator = TRANSLATOR
         self.dictionary_type = "English"
         self.region_detect_scale = 100
+        self.max_dict_entries = 4
+        self.max_dict_senses = 4
         self.show_ocr_text = True
         self.show_furigana = True
         self.japanese_font = "Meiryo"
@@ -2447,7 +2449,7 @@ class KwaScreenApp:
                         ly += _nlines(pf, meta_text.strip(), wrap_w_inner) * pos_h + 4
 
                     sorted_senses = _sort_entry_senses(entry.senses, pos)
-                    for si, sense in enumerate(sorted_senses):
+                    for si, sense in enumerate(sorted_senses[:self.max_dict_senses]):
                         gloss_text = sense.gloss[0].text if sense.gloss else ""
                         num = f"{si + 1}."
                         num_w = pf.measure(num)
@@ -2476,7 +2478,7 @@ class KwaScreenApp:
                 entries = _sort_jamdict_entries(list(res.entries), pos=pos, hira=hira, word=word, conj=conj)
                 if DEBUG_DICT_LOG:
                     _append_debug_log(f"dict lookup show: word={word!r} pos={pos!r} conj={conj!r} hira={hira!r} entries={len(entries)}")
-                    for entry in entries[:4]:
+                    for entry in entries[:self.max_dict_entries]:
                         kanji_texts = [k.text for k in entry.kanji_forms]
                         kana_texts = [k.text for k in entry.kana_forms]
                         glosses = [g.text for s in entry.senses[:1] for g in getattr(s, 'gloss', [])]
@@ -2490,7 +2492,7 @@ class KwaScreenApp:
                             preferred_entries.insert(0, preferred_entries.pop(i))
                             break
                 
-                for idx, entry in enumerate(preferred_entries[:4]):
+                for idx, entry in enumerate(preferred_entries[:self.max_dict_entries]):
                     if idx == 0:
                         self._dict_top_entry = entry
                     kanji_texts = [k.text for k in entry.kanji_forms]
@@ -2508,7 +2510,7 @@ class KwaScreenApp:
                     ly += _nlines(tf, header, wrap_w) * title_h + 4
                     
                     sorted_senses = _sort_entry_senses(entry.senses, pos)
-                    for si, sense in enumerate(sorted_senses[:3]):
+                    for si, sense in enumerate(sorted_senses[:self.max_dict_senses]):
                         glosses = ", ".join(g.text for g in sense.gloss)
                         pos_str = " • ".join(sense.pos) if sense.pos else ""
                         
