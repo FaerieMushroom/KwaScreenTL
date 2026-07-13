@@ -13,6 +13,7 @@ import ctypes
 import ctypes.wintypes
 import sys
 import logging
+import translation_service
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageTk
 from functools import lru_cache
@@ -23,7 +24,6 @@ import jaconv
 import pykakasi
 from jamdict import Jamdict
 from sudachipy import Dictionary, SplitMode
-from deep_translator import GoogleTranslator
 
 from hotkeys import register_hotkey_win32, _hk_display, _vk_to_display, MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_NOREPEAT
 from settings import SettingsManager
@@ -32,7 +32,6 @@ from utils import (
     contains_japanese, _is_kanji, _is_kana,
     find_word_at_point, get_chunk_at_offset, get_chunk_field, get_combined_chunk_forms,
     get_single_char_at_offset,
-    load_api_keys as _load_api_keys, save_api_keys as _save_api_keys,
     make_translucent, user32,
     WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE, GWL_EXSTYLE,
     LWA_COLORKEY, LWA_ALPHA, RGN_OR, SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE,
@@ -282,16 +281,6 @@ BORDER_WIDTH = 5
 CARD_BG = "#f2f2f7"
 
 
-
-_deepl_api_key = None
-
-def get_deepl_api_key():
-    global _deepl_api_key
-    if _deepl_api_key is None:
-        keys = _load_api_keys()
-        _deepl_api_key = keys.get("deepl", "")
-    return _deepl_api_key
-
 # ── PaddleOCR lazy loader ──────────────────────────────────────────────────
 _paddle_ocr = None
 
@@ -324,91 +313,6 @@ def get_paddle_ocr():
             text_recognition_batch_size=16,
         )
     return _paddle_ocr
-
-def translate_deepl(text):
-    import requests
-    key = get_deepl_api_key()
-    if not key:
-        return "[DeepL: no API key - add to apikeys.json]"
-    resp = requests.post(
-        "https://api-free.deepl.com/v2/translate",
-        headers={"Authorization": f"DeepL-Auth-Key {key}"},
-        json={"text": [text], "source_lang": "JA", "target_lang": "EN"}
-    )
-    if resp.status_code == 403:
-        return "[DeepL: Unauthorized - check your API key]"
-    resp.raise_for_status()
-    return resp.json()["translations"][0]["text"]
-
-_translation_cache = {}
-_trans_hits = 0
-_trans_misses = 0
-_TRANSLATION_CACHE_MAX = 1000
-
-def _cache_path(service):
-    return os.path.join(_PROJECT_DIR, "Data", f"translation_cache_{service}.json")
-
-def _load_cache(service):
-    global _translation_cache
-    _translation_cache = {}
-    try:
-        with open(_cache_path(service), "r") as f:
-            raw = json.load(f)
-    except Exception:
-        return
-    for k, v in raw.items():
-        if isinstance(v, dict) and "translation" in v:
-            _translation_cache[k] = v
-        else:
-            _translation_cache[k] = {"translation": v, "hits": 0}
-    _cache_trim()
-
-def _save_cache(service):
-    try:
-        with open(_cache_path(service), "w") as f:
-            json.dump(_translation_cache, f, indent=2)
-    except Exception:
-        pass
-
-def _cache_trim():
-    if len(_translation_cache) <= _TRANSLATION_CACHE_MAX:
-        return
-    sorted_items = sorted(_translation_cache.items(), key=lambda x: x[1]["hits"])
-    for k, _ in sorted_items[:len(sorted_items) - _TRANSLATION_CACHE_MAX]:
-        del _translation_cache[k]
-
-def _translate_or_cached(text):
-    """Return cached translation result or translate and cache it (DeepL)."""
-    global _trans_hits, _trans_misses
-    if text in _translation_cache:
-        _trans_hits += 1
-        _translation_cache[text]["hits"] += 1
-        return _translation_cache[text]["translation"]
-    _trans_misses += 1
-    result = translate_deepl(text)
-    if not result.startswith("["):
-        _translation_cache[text] = {"translation": result, "hits": 1}
-        _cache_trim()
-        _save_cache("deepl")
-    return result
-
-def translate_deepl_batch(texts):
-    """Translate a batch of Japanese texts to English via a single DeepL API call."""
-    if not texts:
-        return []
-    import requests
-    key = get_deepl_api_key()
-    if not key:
-        return ["[DeepL: no API key - add to apikeys.json]"] * len(texts)
-    resp = requests.post(
-        "https://api-free.deepl.com/v2/translate",
-        headers={"Authorization": f"DeepL-Auth-Key {key}"},
-        json={"text": texts, "source_lang": "JA", "target_lang": "EN"}
-    )
-    if resp.status_code == 403:
-        return ["[DeepL: Unauthorized - check your API key]"] * len(texts)
-    resp.raise_for_status()
-    return [t["text"] for t in resp.json()["translations"]]
 
 # Win32 structures for mouse cursor position
 class POINT(ctypes.Structure):
@@ -872,9 +776,9 @@ def translate_and_convert(japanese_text, do_translate=True):
 
         if do_translate:
             if TRANSLATOR == "deepl":
-                english = _translate_or_cached(japanese_text)
+                english = translation_service.translate_or_cached(japanese_text)
             else:
-                english = GoogleTranslator(source='ja', target='en').translate(japanese_text)
+                english = translation_service.translate_google(japanese_text)
         else:
             english = ""
     except Exception as e:
@@ -1085,7 +989,7 @@ class KwaScreenApp:
         self._hk_dirty = threading.Event()
         self.settings = SettingsManager(self)
         self.settings.load()
-        _load_cache(self.translator)
+        translation_service.load_cache(self.translator)
 
         if self.dictionary_type == "Monolingual":
             self.root.after(0, self._check_dict_files)
@@ -1268,11 +1172,11 @@ class KwaScreenApp:
                     self._prev_cache_hits = ci.hits
                     self._prev_cache_misses = ci.misses
                     print(f"Process cache: {dh} hits, {dm} misses, {ci.currsize} entries")
-                    dh2 = _trans_hits - getattr(self, '_prev_trans_hits', 0)
-                    dm2 = _trans_misses - getattr(self, '_prev_trans_misses', 0)
-                    self._prev_trans_hits = _trans_hits
-                    self._prev_trans_misses = _trans_misses
-                    print(f"Translation cache: {dh2} hits, {dm2} misses, {len(_translation_cache)} entries")
+                    dh2 = translation_service.trans_hits - getattr(self, '_prev_trans_hits', 0)
+                    dm2 = translation_service.trans_misses - getattr(self, '_prev_trans_misses', 0)
+                    self._prev_trans_hits = translation_service.trans_hits
+                    self._prev_trans_misses = translation_service.trans_misses
+                    print(f"Translation cache: {dh2} hits, {dm2} misses, {translation_service.cache_size()} entries")
                     print(f"Total: {total:.0f}ms\n")
                     # Re-render card if currently showing (data was updated in-place)
                     if self._card_window and self._card_data_idx >= 0:
@@ -1300,9 +1204,9 @@ class KwaScreenApp:
         self.msg_queue.put(("toggle_settings", None))
 
     def _switch_translator(self, val):
-        _save_cache(self.translator)
+        translation_service.save_cache(self.translator)
         self.translator = val
-        _load_cache(val)
+        translation_service.load_cache(val)
         self.settings.save()
         if val == "deepl":
             self._ensure_deepl_key()
@@ -1331,33 +1235,20 @@ class KwaScreenApp:
         return has_sankoku and has_kanki
 
     def _ensure_deepl_key(self):
-        if get_deepl_api_key():
+        if translation_service.get_deepl_api_key():
             return
         parent = self.settings.window or self.root
         key = tksd.askstring("DeepL API Key", "Enter your DeepL API key:", parent=parent)
         if key:
             key = key.strip()
             try:
-                keys = _load_api_keys()
-                keys["deepl"] = key
-                _save_api_keys(keys)
-                global _deepl_api_key
-                _deepl_api_key = key
+                translation_service.set_deepl_api_key(key)
             except Exception as e:
                 import tkinter.messagebox as tkmb
                 tkmb.showerror("Error", f"Failed to save API key:\n{e}", parent=parent)
 
     def _purge_caches(self):
-        for svc in ("deepl", "google"):
-            p = _cache_path(svc)
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-        _translation_cache.clear()
-        global _trans_hits, _trans_misses
-        _trans_hits = 0
-        _trans_misses = 0
+        translation_service.purge_all_caches()
 
     def _refresh_hover_card(self):
         self._hide_card()
@@ -1367,30 +1258,26 @@ class KwaScreenApp:
     def _retranslate_boxes(self):
         """Re-translate all OCR boxes whose english field is empty."""
         boxes = list(self.ocr_boxes)
+        svc = self.translator
         def _do():
-            global _trans_hits, _trans_misses
+            errors = []
             for box in boxes:
                 text = box['data'].get('original', '')
                 if text and not box['data'].get('english'):
                     try:
-                        if text in _translation_cache:
-                            _trans_hits += 1
-                            _translation_cache[text]["hits"] += 1
-                            eng = _translation_cache[text]["translation"]
+                        eng = translation_service.translate_or_cached(text, service=svc)
+                        if translation_service.is_error(eng):
+                            errors.append(eng)
                         else:
-                            _trans_misses += 1
-                            if self.translator == "deepl":
-                                eng = translate_deepl(text)
-                            else:
-                                eng = GoogleTranslator(source='ja', target='en').translate(text)
-                            if not eng.startswith("["):
-                                _translation_cache[text] = {"translation": eng, "hits": 1}
-                                _cache_trim()
-                                _save_cache(self.translator)
-                        box['data']['english'] = eng
+                            box['data']['english'] = eng
                     except Exception:
                         pass
-            self.root.after(0, self._refresh_hover_card)
+            def _done():
+                self._refresh_hover_card()
+                if errors:
+                    msg = "\n".join(dict.fromkeys(errors))
+                    tkmb.showwarning("Translation Error", msg, parent=self.root)
+            self.root.after(0, _done)
         threading.Thread(target=_do, daemon=True).start()
 
     def capture_window(self):
@@ -1762,19 +1649,17 @@ class KwaScreenApp:
             if self.show_translation and translation_targets:
                 trans_start = time.time()
                 texts = [t[0] for t in translation_targets]
-                global _trans_hits, _trans_misses
                 uncached_texts = []
                 uncached_indices = []
                 for i, t in enumerate(texts):
-                    if t in _translation_cache:
-                        _trans_hits += 1
-                        _translation_cache[t]["hits"] += 1
-                        eng = _translation_cache[t]["translation"]
+                    cached = translation_service.cache_lookup(t)
+                    if cached is not None:
+                        eng = cached
                         boxes[i]['data']['english'] = eng
                         h_extra = (len(eng) // 40) * 16
                         boxes[i]['h'] = boxes[i]['orig_bbox']['height'] + 130 + h_extra
                     else:
-                        _trans_misses += 1
+                        translation_service.trans_misses += 1
                         uncached_texts.append(t)
                         uncached_indices.append(i)
                 # Push cached translations immediately (card re-render only, no stats)
@@ -1782,19 +1667,25 @@ class KwaScreenApp:
                     self.msg_queue.put(("cached_translations_ready", None))
                 if uncached_texts:
                     if self.translator == "deepl":
-                        batch_results = translate_deepl_batch(uncached_texts)
+                        batch_results = translation_service.translate_deepl_batch(uncached_texts)
                     else:
-                        batch_results = [GoogleTranslator(source='ja', target='en').translate(t) for t in uncached_texts]
+                        batch_results = translation_service.translate_google_batch(uncached_texts)
+                    batch_errors = []
                     for t, res in zip(uncached_texts, batch_results):
-                        if not res.startswith("["):
-                            _translation_cache[t] = {"translation": res, "hits": 1}
-                    _cache_trim()
-                    _save_cache(self.translator)
+                        if not translation_service.is_error(res):
+                            translation_service.cache_store(t, res)
+                        else:
+                            batch_errors.append(res)
+                    translation_service.cache_trim()
+                    translation_service.save_cache(self.translator)
                     for idx, res in zip(uncached_indices, batch_results):
-                        if idx < len(boxes) and res is not None:
+                        if idx < len(boxes) and res is not None and not translation_service.is_error(res):
                             boxes[idx]['data']['english'] = res
                             h_extra = (len(res) // 40) * 16
                             boxes[idx]['h'] = boxes[idx]['orig_bbox']['height'] + 130 + h_extra
+                    if batch_errors and self._ocr_gen == ocr_gen:
+                        msg = "\n".join(dict.fromkeys(batch_errors))
+                        self.root.after(0, lambda m=msg: tkmb.showwarning("Translation Error", m, parent=self.root))
                 self._last_translation_ms = (time.time() - trans_start) * 1000
             else:
                 self._last_translation_ms = 0
@@ -2843,12 +2734,16 @@ class KwaScreenApp:
         self._hide_dict_card()
 
         if self.translator == "deepl":
-            english = _translate_or_cached(text)
+            english = translation_service.translate_or_cached(text)
         else:
             try:
-                english = GoogleTranslator(source='ja', target='en').translate(text)
+                english = translation_service.translate_google(text)
             except Exception as e:
                 english = f"[Translation error: {e}]"
+
+        if translation_service.is_error(english):
+            tkmb.showwarning("Translation Error", english, parent=self.root)
+            return
 
         card_w = max(box.get('w', 200), 200, 340)
 
