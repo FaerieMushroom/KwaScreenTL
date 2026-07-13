@@ -912,6 +912,19 @@ def _sort_jamdict_entries(entries, pos='', hira='', word='', conj=''):
     return sorted(entries, key=lambda entry: (_reading_rank(entry), _word_rank(entry), _context_rank(entry), _sense_rank(entry), _pos_rank(entry), _form_rank(entry)))
 
 
+def _sort_entry_senses(senses, contextual_pos):
+    """Bubble senses whose POS tags match the contextual POS to the top."""
+    if not senses or not contextual_pos:
+        return senses
+    def _sense_priority(sense):
+        pos_tags = getattr(sense, 'pos', None) or []
+        for p in pos_tags:
+            if contextual_pos in re.split(r'[^a-z]+', p.lower()):
+                return 0
+        return 1
+    return sorted(senses, key=_sense_priority)
+
+
 def _append_ocr_line(lines, text, x1, y1, x2, y2, vertical):
     line_bbox = {'x': x1, 'y': y1, 'width': x2 - x1, 'height': y2 - y1}
     chars = list(text)
@@ -2433,7 +2446,8 @@ class KwaScreenApp:
                                            fill="#8e8e93", anchor="nw", width=wrap_w_inner)
                         ly += _nlines(pf, meta_text.strip(), wrap_w_inner) * pos_h + 4
 
-                    for si, sense in enumerate(entry.senses):
+                    sorted_senses = _sort_entry_senses(entry.senses, pos)
+                    for si, sense in enumerate(sorted_senses):
                         gloss_text = sense.gloss[0].text if sense.gloss else ""
                         num = f"{si + 1}."
                         num_w = pf.measure(num)
@@ -2493,7 +2507,8 @@ class KwaScreenApp:
                     canvas.create_text(pad_x, ly, text=header, font=title_font, fill="#0066cc", anchor="nw", width=wrap_w)
                     ly += _nlines(tf, header, wrap_w) * title_h + 4
                     
-                    for si, sense in enumerate(entry.senses[:3]):
+                    sorted_senses = _sort_entry_senses(entry.senses, pos)
+                    for si, sense in enumerate(sorted_senses[:3]):
                         glosses = ", ".join(g.text for g in sense.gloss)
                         pos_str = " • ".join(sense.pos) if sense.pos else ""
                         
