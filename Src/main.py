@@ -264,7 +264,7 @@ else:
 # ── Language filter ─────────────────────────────────────────────────────────
 # When True, non-Japanese OCR text (numbers, English UI) is skipped.
 # Set to False to show everything (useful for debugging OCR coverage).
-SKIP_NON_JAPANESE = False
+SKIP_NON_JAPANESE = True
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Window capture crop (px to trim from captured window edges) ──────────────
@@ -986,6 +986,7 @@ class KwaScreenApp:
         self.show_crop = True
         self.show_romaji = True
         self.skip_non_japanese = SKIP_NON_JAPANESE
+        self.skip_numeric_only = True
         self.show_translation = TRANSLATOR != "none"
         self.translator = TRANSLATOR
         self.dictionary_type = "English"
@@ -1681,7 +1682,9 @@ class KwaScreenApp:
                 text = re.sub(r'\s+', '', text)
                 if not text:
                     continue
-                if self.skip_non_japanese and not contains_japanese(text) and not text.isdigit():
+                if self.skip_non_japanese and not contains_japanese(text):
+                    continue
+                if self.skip_numeric_only and text.isdigit():
                     continue
                 translation_targets.append((text, bbox, words_data))
 
