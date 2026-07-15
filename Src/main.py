@@ -32,7 +32,7 @@ from utils import (
     contains_japanese, _is_kanji, _is_kana,
     find_word_at_point, get_chunk_at_offset, get_chunk_field, get_combined_chunk_forms,
     get_single_char_at_offset,
-    make_translucent, user32,
+    make_translucent, user32, get_foreground_window_name,
     WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE, GWL_EXSTYLE,
     LWA_COLORKEY, LWA_ALPHA, RGN_OR, SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE,
 )
@@ -978,6 +978,7 @@ class KwaScreenApp:
         self._dict_lookup_seq = 0
         self._ctrl_held = False
         self._prev_focus_hwnd = None
+        self._window_name = None
         self._loading_win = None
         self._overlay_hidden = False
         self._selection_box_idx = -1
@@ -1194,7 +1195,15 @@ class KwaScreenApp:
                     dm2 = translation_service.trans_misses - getattr(self, '_prev_trans_misses', 0)
                     self._prev_trans_hits = translation_service.trans_hits
                     self._prev_trans_misses = translation_service.trans_misses
-                    print(f"Translation cache: {dh2} hits, {dm2} misses, {translation_service.cache_size()} entries")
+                    src_parts = []
+                    sc = getattr(self, '_last_src_cache', 0)
+                    sd = getattr(self, '_last_src_db', 0)
+                    sn = getattr(self, '_last_src_network', 0)
+                    if sc: src_parts.append(f"Cache={sc}")
+                    if sd: src_parts.append(f"LocalDB={sd}")
+                    if sn: src_parts.append(f"TranslationService={sn}")
+                    src_str = " | ".join(src_parts) if src_parts else "none"
+                    print(f"Translation: {dh2} hits, {dm2} misses, {translation_service.cache_size()} entries ({src_str})")
                     print(f"Total: {total:.0f}ms\n")
                     # Re-render card if currently showing (data was updated in-place)
                     if self._card_window and self._card_data_idx >= 0:
@@ -1269,6 +1278,8 @@ class KwaScreenApp:
 
     def _purge_caches(self):
         translation_service.purge_all_caches()
+        self._prev_trans_hits = 0
+        self._prev_trans_misses = 0
 
     def _refresh_hover_card(self):
         self._hide_card()
@@ -1379,6 +1390,7 @@ class KwaScreenApp:
         # Capture currently active window handle + its screen bounds
         fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
         self._prev_focus_hwnd = fg_hwnd
+        self._window_name = get_foreground_window_name()
         rect = ctypes.wintypes.RECT()
         ctypes.windll.user32.GetWindowRect(fg_hwnd, ctypes.byref(rect))
         win_rect = {'left': rect.left, 'top': rect.top, 'right': rect.right, 'bottom': rect.bottom}
@@ -1444,7 +1456,7 @@ class KwaScreenApp:
         self._ocr_gen += 1
         threading.Thread(
             target=self.process_ocr,
-            args=(self.pil_img, win_local, self._ocr_gen, None),
+            args=(self.pil_img, win_local, self._ocr_gen, None, self._window_name),
             daemon=True
         ).start()
 
@@ -1559,7 +1571,7 @@ class KwaScreenApp:
         self._ocr_gen += 1
         threading.Thread(
             target=self.process_ocr,
-            args=(self.pil_img, win_local, self._ocr_gen, 100),
+            args=(self.pil_img, win_local, self._ocr_gen, 100, None),
             daemon=True
         ).start()
 
@@ -1649,7 +1661,7 @@ class KwaScreenApp:
         self._last_ocr_hcount = h_count
         return lines
 
-    def process_ocr(self, pil_img, win_local, ocr_gen, detect_scale=None):
+    def process_ocr(self, pil_img, win_local, ocr_gen, detect_scale=None, window_name=None):
         """Run OCR on the focused window crop only, then offset boxes to screen coords.
         `ocr_gen` is a generation counter used to discard stale results if a new scan starts."""
         win_x, win_y = win_local['x'], win_local['y']
@@ -1739,6 +1751,10 @@ class KwaScreenApp:
             self._last_proc_ms = (time.time() - proc_start) * 1000
 
             # Phase 2: batch translation API (cached)
+            _src_cache = 0
+            _src_db = 0
+            _src_network = 0
+            _all_translations = []
             if self.show_translation and translation_targets:
                 trans_start = time.time()
                 texts = [t[0] for t in translation_targets]
@@ -1751,6 +1767,8 @@ class KwaScreenApp:
                         boxes[i]['data']['english'] = eng
                         h_extra = (len(eng) // 40) * 16
                         boxes[i]['h'] = boxes[i]['orig_bbox']['height'] + 130 + h_extra
+                        _src_cache += 1
+                        _all_translations.append((t, eng))
                     else:
                         translation_service.trans_misses += 1
                         uncached_texts.append(t)
@@ -1758,20 +1776,51 @@ class KwaScreenApp:
                 # Push cached translations immediately (card re-render only, no stats)
                 if self._ocr_gen == ocr_gen:
                     self.msg_queue.put(("cached_translations_ready", None))
-                if uncached_texts:
+                # Check game DB for texts not in in-memory cache
+                db_found_texts = []
+                db_found_indices = []
+                still_uncached_texts = []
+                still_uncached_indices = []
+                if uncached_texts and window_name is not None:
+                    for t, idx in zip(uncached_texts, uncached_indices):
+                        db_hit = translation_service.game_db_lookup(t, window_name)
+                        if db_hit is not None:
+                            translation_service.cache_store(t, db_hit)
+                            db_found_texts.append(t)
+                            db_found_indices.append(idx)
+                            _src_db += 1
+                            _all_translations.append((t, db_hit))
+                        else:
+                            still_uncached_texts.append(t)
+                            still_uncached_indices.append(idx)
+                else:
+                    still_uncached_texts = uncached_texts
+                    still_uncached_indices = uncached_indices
+                # Apply game DB hits to boxes
+                for t, idx in zip(db_found_texts, db_found_indices):
+                    if idx < len(boxes):
+                        eng = translation_service.cache_lookup(t)
+                        if eng is not None:
+                            boxes[idx]['data']['english'] = eng
+                            h_extra = (len(eng) // 40) * 16
+                            boxes[idx]['h'] = boxes[idx]['orig_bbox']['height'] + 130 + h_extra
+                # Network translation for anything still uncached
+                if still_uncached_texts:
+                    _src_network = len(still_uncached_texts)
                     if self.translator == "deepl":
-                        batch_results = translation_service.translate_deepl_batch(uncached_texts)
+                        batch_results = translation_service.translate_deepl_batch(still_uncached_texts)
                     else:
-                        batch_results = translation_service.translate_google_batch(uncached_texts)
+                        batch_results = translation_service.translate_google_batch(still_uncached_texts)
                     batch_errors = []
-                    for t, res in zip(uncached_texts, batch_results):
+                    for t, res in zip(still_uncached_texts, batch_results):
                         if not translation_service.is_error(res):
                             translation_service.cache_store(t, res)
+                            _all_translations.append((t, res))
                         else:
                             batch_errors.append(res)
                     translation_service.cache_trim()
                     translation_service.save_cache(self.translator)
-                    for idx, res in zip(uncached_indices, batch_results):
+                    for idx, res in zip(still_uncached_indices, batch_results):
                         if idx < len(boxes) and res is not None and not translation_service.is_error(res):
                             boxes[idx]['data']['english'] = res
                             h_extra = (len(res) // 40) * 16
@@ -1779,6 +1828,11 @@ class KwaScreenApp:
                     if batch_errors and self._ocr_gen == ocr_gen:
                         msg = "\n".join(dict.fromkeys(batch_errors))
                         self.root.after(0, lambda m=msg: tkmb.showwarning("Translation Error", m, parent=self.root))
+                # Store all translations to game DB (cache hits + DB hits + network results)
+                if window_name is not None and _all_translations:
+                    t_list = [t for t, _ in _all_translations]
+                    r_list = [r for _, r in _all_translations]
+                    translation_service.game_db_batch_store(t_list, r_list, window_name)
                 self._last_translation_ms = (time.time() - trans_start) * 1000
             else:
                 self._last_translation_ms = 0
@@ -1786,6 +1840,9 @@ class KwaScreenApp:
             # Notify main thread that data is fully ready (final push)
             if self._ocr_gen != ocr_gen:
                 return
+            self._last_src_cache = _src_cache
+            self._last_src_db = _src_db
+            self._last_src_network = _src_network
             self.msg_queue.put(("ocr_data_ready", len(boxes)))
 
         except Exception:

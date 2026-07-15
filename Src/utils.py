@@ -7,6 +7,9 @@ import ctypes.wintypes
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(os.path.join(_PROJECT_DIR, "Data"), exist_ok=True)
 
+APP_DATABASES_DIR = os.path.join(_PROJECT_DIR, "AppDatabases")
+os.makedirs(APP_DATABASES_DIR, exist_ok=True)
+
 SANKOKU_DB = os.path.join(_PROJECT_DIR, "KwaScreenTLMonolingual", "sankokudict.db")
 KANKI_DB = os.path.join(_PROJECT_DIR, "KwaScreenTLMonolingual", "kankidict.db")
 API_KEYS_FILE = os.path.join(_PROJECT_DIR, "Data", "apikeys.json")
@@ -116,3 +119,23 @@ def make_translucent(hwnd, alpha=0xBB):
         user32.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA)
     except Exception:
         pass
+
+def get_foreground_window_name():
+    """Return the title of the current foreground window, sanitized for use as a filename.
+    Returns 'Generic' if the title cannot be determined."""
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return "Generic"
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return "Generic"
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if not title:
+            return "Generic"
+        title = re.sub(r'[\\/:*?"<>|\s]+', '', title)
+        return title if title else "Generic"
+    except Exception:
+        return "Generic"

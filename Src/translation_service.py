@@ -2,9 +2,10 @@
 
 import os
 import json
+import sqlite3
 import requests
 from deep_translator import GoogleTranslator
-from utils import _PROJECT_DIR, load_api_keys as _load_api_keys, save_api_keys as _save_api_keys
+from utils import _PROJECT_DIR, APP_DATABASES_DIR, load_api_keys as _load_api_keys, save_api_keys as _save_api_keys
 
 
 # ── API Key Management ────────────────────────────────────────────────────────
@@ -195,6 +196,81 @@ def cache_store(text, translation):
         return
     _translation_cache[text] = {"translation": translation, "hits": 1}
     cache_trim()
+
+
+# ── Game-Specific Persistent DB (per-window SQLite) ─────────────────────────
+
+_game_db_connections = {}
+
+def _game_db_path(window_name):
+    return os.path.join(APP_DATABASES_DIR, f"{window_name}_TL.db")
+
+def _get_game_db(window_name):
+    """Return a sqlite3 connection for the given window's DB, creating it if needed."""
+    if window_name in _game_db_connections:
+        return _game_db_connections[window_name]
+    try:
+        path = _game_db_path(window_name)
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS translations (
+                original TEXT PRIMARY KEY,
+                translation TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        _game_db_connections[window_name] = conn
+        return conn
+    except Exception:
+        return None
+
+def game_db_lookup(text, window_name):
+    """Look up a translation in the window-specific game DB. Returns translation or None."""
+    conn = _get_game_db(window_name)
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT translation FROM translations WHERE original = ?", (text,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+def game_db_store(text, translation, window_name):
+    """Store a translation in the window-specific game DB."""
+    if is_error(translation):
+        return
+    conn = _get_game_db(window_name)
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO translations (original, translation) VALUES (?, ?)",
+            (text, translation)
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+def game_db_batch_store(texts, translations, window_name):
+    """Store multiple translations in the window-specific game DB in a single commit."""
+    conn = _get_game_db(window_name)
+    if conn is None:
+        return
+    try:
+        pairs = [(t, r) for t, r in zip(texts, translations) if not is_error(r)]
+        if pairs:
+            conn.executemany(
+                "INSERT OR IGNORE INTO translations (original, translation) VALUES (?, ?)",
+                pairs
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 
 
 # ── Cached Translation ────────────────────────────────────────────────────────
