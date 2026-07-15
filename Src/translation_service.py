@@ -238,10 +238,11 @@ def game_db_lookup(text, window_name):
     if conn is None:
         return None
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT translation FROM translations WHERE original = ?", (text,))
-        row = cur.fetchone()
-        return row[0] if row else None
+        with _game_db_lock:
+            cur = conn.cursor()
+            cur.execute("SELECT translation FROM translations WHERE original = ?", (text,))
+            row = cur.fetchone()
+            return row[0] if row else None
     except Exception as e:
         logger.debug("game_db_lookup failed for %s: %s", window_name, e)
         return None
