@@ -120,22 +120,34 @@ def make_translucent(hwnd, alpha=0xBB):
     except Exception:
         pass
 
-def get_foreground_window_name():
-    """Return the title of the current foreground window, sanitized for use as a filename.
-    Returns 'Generic' if the title cannot be determined."""
+def get_foreground_process_name():
+    """Return the process executable name of the foreground window, sanitized for use as a filename.
+    Falls back to 'Generic' if the process name cannot be determined."""
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     try:
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return "Generic"
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
             return "Generic"
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value.strip()
-        if not title:
+        kernel32 = ctypes.windll.kernel32
+        h_process = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h_process:
             return "Generic"
-        title = re.sub(r'[\\/:*?"<>|\s]+', '', title)
-        return title if title else "Generic"
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            size = ctypes.wintypes.DWORD(260)
+            psapi = ctypes.windll.psapi
+            if not psapi.GetModuleFileNameExW(h_process, None, buf, ctypes.byref(size)):
+                return "Generic"
+            name = os.path.splitext(os.path.basename(buf.value))[0]
+            if not name:
+                return "Generic"
+            name = re.sub(r'[\\/:*?"<>|\s]+', '', name)
+            return name if name else "Generic"
+        finally:
+            kernel32.CloseHandle(h_process)
     except Exception:
         return "Generic"

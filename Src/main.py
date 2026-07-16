@@ -32,7 +32,7 @@ from utils import (
     contains_japanese, _is_kanji, _is_kana,
     find_word_at_point, get_chunk_at_offset, get_chunk_field, get_combined_chunk_forms,
     get_single_char_at_offset,
-    make_translucent, user32, get_foreground_window_name,
+    make_translucent, user32, get_foreground_process_name,
     WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE, GWL_EXSTYLE,
     LWA_COLORKEY, LWA_ALPHA, RGN_OR, SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE,
 )
@@ -1514,7 +1514,7 @@ class KwaScreenApp:
         # Capture currently active window handle + its screen bounds
         fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
         self._prev_focus_hwnd = fg_hwnd
-        self._window_name = get_foreground_window_name()
+        self._window_name = get_foreground_process_name()
         rect = ctypes.wintypes.RECT()
         ctypes.windll.user32.GetWindowRect(fg_hwnd, ctypes.byref(rect))
         win_rect = {'left': rect.left, 'top': rect.top, 'right': rect.right, 'bottom': rect.bottom}
