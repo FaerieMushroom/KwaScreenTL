@@ -1332,23 +1332,27 @@ class KwaScreenApp:
                 BOX_PAD, BOX_PAD, BOX_PAD + bw, BOX_PAD + bh,
                 fill="white", outline="", tags="in_region_bg"
             )
-            # Find largest font size that fits
+            # Find largest font size that fits (single line or wrapped)
             pad = 4
             max_w = bw - pad * 2
             max_h = bh - pad * 2
-            font_size = max(8, bh // 3)
-            # Try to fit in one line first, shrink if needed
+            font_size = max(7, bh // 3)
             f = tkfont.Font(family="Segoe UI", size=font_size)
-            while font_size > 8:
+            while font_size > 7:
                 f.configure(size=font_size)
                 tw = f.measure(eng)
                 th = f.metrics("linespace")
-                if tw <= max_w and th <= max_h:
-                    break
+                if tw <= max_w:
+                    if th <= max_h:
+                        break
+                else:
+                    nlines = _nlines(f, eng, max_w)
+                    if nlines * th <= max_h:
+                        break
                 font_size -= 1
-            f.configure(size=max(8, font_size))
+            f.configure(size=max(7, font_size))
             # If still too wide, use wrapping
-            final_fs = max(8, font_size)
+            final_fs = max(5, font_size)
             canvas.create_text(
                 BOX_PAD + bw // 2, BOX_PAD + bh // 2,
                 text=eng, font=("Segoe UI", final_fs),
